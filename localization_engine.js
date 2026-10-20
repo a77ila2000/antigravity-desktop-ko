@@ -1,0 +1,5106 @@
+const fs = require('fs');
+const path = require('path');
+const child_process = require('child_process');
+const vm = require('vm');
+
+if (process.platform === 'win32') {
+    const defaultNodePaths = [
+        'C:\\Program Files\\nodejs',
+        'C:\\Program Files (x86)\\nodejs',
+        path.join(process.env.LOCALAPPDATA || '', 'Programs', 'node'),
+        path.join(process.env.APPDATA || '', 'npm')
+    ];
+    for (const nodePath of defaultNodePaths) {
+        if (fs.existsSync(nodePath)) {
+            if (!process.env.PATH.includes(nodePath)) {
+                process.env.PATH = `${nodePath};${process.env.PATH}`;
+            }
+        }
+    }
+}
+
+const DICTS_FOLDER = 'dicts';
+const BRAND_TITLE_ALIASES = {
+    english: 'english',
+    en: 'english',
+    default: 'english',
+    hidden: 'hidden',
+    hide: 'hidden',
+    none: 'hidden'
+};
+
+function getOptionValue(name, defaultValue) {
+    const args = process.argv.slice(2);
+    for (let i = 0; i < args.length; i++) {
+        if (args[i] === name) {
+            return args[i + 1] || defaultValue;
+        }
+        if (args[i].startsWith(name + '=')) {
+            return args[i].slice(name.length + 1);
+        }
+    }
+    return defaultValue;
+}
+
+const BRAND_TITLE_MODE = BRAND_TITLE_ALIASES[String(getOptionValue('--brand-title', 'english')).toLowerCase()] || 'english';
+
+const SIGNATURE_START = "'__ANTIGRAVITY_CHINESE_LOCALIZATION_START__';";
+const SIGNATURE_END = "'__ANTIGRAVITY_CHINESE_LOCALIZATION_END__';";
+const MENU_SIGNATURE_START = "'__ANTIGRAVITY_NATIVE_MENU_TRANSLATION_START__';";
+const MENU_SIGNATURE_END = "'__ANTIGRAVITY_NATIVE_MENU_TRANSLATION_END__';";
+const TRAY_SIGNATURE_START = "'__ANTIGRAVITY_TRAY_TRANSLATION_START__';";
+const TRAY_SIGNATURE_END = "'__ANTIGRAVITY_TRAY_TRANSLATION_END__';";
+const LEGACY_SIGNATURE_START = ['/', '* --- ANTIGRAVITY CHINESE LOCALIZATION START --- *', '/'].join('');
+const LEGACY_SIGNATURE_END = ['/', '* --- ANTIGRAVITY CHINESE LOCALIZATION END --- *', '/'].join('');
+const LEGACY_MENU_SIGNATURE_START = ['/', '/ =========================================='].join('');
+const LEGACY_MENU_SIGNATURE_END = 'translateMenu(menu.items);';
+const LEGACY_TRAY_SIGNATURE_START = ['/', '* --- TRAY TRANSLATION START --- *', '/'].join('');
+const LEGACY_TRAY_SIGNATURE_END = ['/', '* --- TRAY TRANSLATION END --- *', '/'].join('');
+
+function normalizeText(text) {
+    if (!text) return "";
+    return text.replace(/\s+/g, ' ')
+               .trim()
+               .replace(/’/g, "'")
+               .replace(/‘/g, "'")
+               .replace(/“/g, '"')
+               .replace(/”/g, '"');
+}
+
+function loadDictionary() {
+    const totalMap = {};
+    const dictsDir = path.join(__dirname, DICTS_FOLDER);
+    if (fs.existsSync(dictsDir)) {
+        const files = fs.readdirSync(dictsDir).filter(file => file.endsWith('.json')).sort();
+        for (const file of files) {
+            try {
+                const filePath = path.join(dictsDir, file);
+                const fileContent = fs.readFileSync(filePath, 'utf-8');
+                const data = JSON.parse(fileContent);
+                for (const [k, v] of Object.entries(data)) {
+                    const normK = normalizeText(k);
+                    if (normK) totalMap[normK] = v;
+                }
+            } catch (e) {
+            }
+        }
+    }
+    if (BRAND_TITLE_MODE === 'hidden') {
+        totalMap[normalizeText('Antigravity')] = '';
+    } else {
+        delete totalMap[normalizeText('Antigravity')];
+    }
+
+    // Streaming model output can arrive as tiny text fragments. Translating
+    // short standalone English tokens (for example "on" or "and") corrupts
+    // otherwise valid agent reasoning. Keep these ambiguous tokens in English;
+    // native menus are localized separately below.
+    for (const key of Object.keys(totalMap)) {
+        if (/^[A-Za-z]{1,6}$/.test(key)) delete totalMap[key];
+    }
+    return totalMap;
+}
+
+function generateJs() {
+    const fullDict = loadDictionary();
+    const longEntries = Object.entries(fullDict).sort((a, b) => b[0].length - a[0].length);
+
+    const dictJson = JSON.stringify(fullDict, null, 4);
+    const entriesJson = JSON.stringify(longEntries);
+
+    const jsSource = `${SIGNATURE_START}
+(() => {
+    const map = new Map(Object.entries(DICT_PLACEHOLDER));
+    const lowerMap = new Map();
+    for (const [k, v] of map.entries()) lowerMap.set(k.toLowerCase(), v);
+
+    const longEntries = REPLACEMENT_ENTRIES_PLACEHOLDER;
+    const translatedValues = new WeakMap();
+
+    const BLOCKED_CLASSES = ['monaco-editor', 'editor-container', 'terminal', 'output-view', 'debug-console', 'code-view', 'artifact-container', 'suggest-widget'];
+    const BLOCKED_TAGS = ['SCRIPT', 'STYLE', 'CODE', 'PRE', 'INPUT', 'TEXTAREA', 'SVG', 'CANVAS', 'SYMBOL', 'PATH'];
+    const AUTO_TRANSLATE_PROTECTED_TAGS = new Set(['CODE', 'PRE', 'INPUT', 'TEXTAREA']);
+    const BLOCKED_TEST_IDS = new Set(['user-input-step']);
+    const SKIP_TRANSLATION_ATTR = 'data-ag-localization-skip';
+
+    function norm(s) {
+        if (!s) return '';
+        return s.replace(/\\s+/g, ' ').replace(/[‘’]/g, "'").replace(/[“”]/g, '"').trim();
+    }
+
+    // Some newer settings/usage strings are translated by the engine's
+    // legacy helpers into Simplified Chinese.  If the original product text
+    // was English, never leave that Chinese fallback on screen: keep the
+    // original English instead.  Korean dictionary entries remain untouched.
+    function containsHan(value) {
+        return typeof value === 'string' && /[\\u3400-\\u9fff]/.test(value);
+    }
+
+    // Long dictionary entries may be replaced inside surrounding UI text, but
+    // they must not match inside a larger English identifier or word.
+    function replaceLongDictionaryEntry(value, key, translated) {
+        if (!value || !key || !value.includes(key)) return value;
+
+        const asciiWord = /[A-Za-z0-9_]/;
+        const needsLeftBoundary = asciiWord.test(key[0]);
+        const needsRightBoundary = asciiWord.test(key[key.length - 1]);
+        let searchFrom = 0;
+        let result = '';
+        let changed = false;
+
+        while (searchFrom < value.length) {
+            const index = value.indexOf(key, searchFrom);
+            if (index === -1) break;
+
+            const end = index + key.length;
+            const hasLeftBoundary = !needsLeftBoundary || index === 0 || !asciiWord.test(value[index - 1]);
+            const hasRightBoundary = !needsRightBoundary || end === value.length || !asciiWord.test(value[end]);
+            if (hasLeftBoundary && hasRightBoundary) {
+                result += value.slice(searchFrom, index) + translated;
+                searchFrom = end;
+                changed = true;
+            } else {
+                result += value.slice(searchFrom, index + 1);
+                searchFrom = index + 1;
+            }
+        }
+
+        return changed ? result + value.slice(searchFrom) : value;
+    }
+
+    function translateWithShortcut(val) {
+        if (!val) return null;
+        const match = val.match(/^(.+?)\\s*\\((Ctrl|Cmd|Alt|Shift|⌘|⌥|⇧|⌃)\\+?([^)]*)\\)$/i);
+        if (match) {
+            const prefix = match[1].trim();
+            const normPref = norm(prefix);
+            const lowerPref = normPref.toLowerCase();
+            let transPref = null;
+            if (map.has(normPref)) {
+                transPref = map.get(normPref);
+            } else if (lowerMap.has(lowerPref)) {
+                transPref = lowerMap.get(lowerPref);
+            }
+            if (transPref) {
+                return transPref + " (" + match[2] + (match[3] ? "+" + match[3] : "") + ")";
+            }
+        }
+        return null;
+    }
+
+    // Git refs are runtime identifiers, so translate only the bounded UI
+    // sentence around them and preserve the ref or remote name verbatim.
+    function getCommitSummaryParts(value) {
+        const normalized = norm(value);
+        const match = normalized.match(/^(?:Commit|提交)\\s*(\\d+)\\s*(?:files?|个文件)\\s*(?:changes?|更改)\\s*to\\s*((?:↗\\s*)?\\S+)$/i);
+        return match ? { count: match[1], target: match[2] } : null;
+    }
+
+    function getVersionControlUiTranslation(value) {
+        const normalized = norm(value);
+        if (/^All changes since the branch point$/i.test(normalized)) {
+            return "自分支点以来的所有更改";
+        }
+
+        let match = normalized.match(/^All changes since (\\S+)$/i);
+        if (match) return "自 " + match[1] + " 以来的所有更改";
+
+        match = normalized.match(/^Publish (\\S+) to origin$/i);
+        if (match) return "将 " + match[1] + " 发布到 origin";
+
+        match = normalized.match(/^Push\\s+(\\d+)\\s+commits?\\s+to\\s+((?:↗\\s*)?\\S+)$/i);
+        if (match) return "将 " + match[1] + " 个提交推送到 " + match[2];
+
+        match = normalized.match(/^Pushed\\s+(\\d+)\\s+commits?\\s+to\\s+((?:↗\\s*)?\\S+)[.。]?$/i);
+        if (match) return "已将 " + match[1] + " 个提交推送到 " + match[2];
+
+        match = normalized.match(/^Committed\\s+to\\s+((?:↗\\s*)?\\S+)[.。]?$/i);
+        if (match) return "已提交到 " + match[1];
+
+        match = normalized.match(/^Amended\\s+commit\\s+on\\s+((?:↗\\s*)?[^\\s.。]+)[.。]?$/i);
+        if (match) return "已在 " + match[1] + " 上修补提交";
+
+        const commitSummary = getCommitSummaryParts(normalized);
+        if (commitSummary) {
+            return "将 " + commitSummary.count + " 个文件的更改提交到 " + commitSummary.target;
+        }
+
+        if (map.has(normalized)) return map.get(normalized);
+        if (lowerMap.has(normalized.toLowerCase())) return lowerMap.get(normalized.toLowerCase());
+
+        const fileStatusMatch = normalized.match(/^(.+?)\\s*\\((uncommitted|unstaged|staged|untracked|modified|deleted|added|all agent edits|agent edits)\\)$/i);
+        if (fileStatusMatch) {
+            const rawPrefix = fileStatusMatch[1].trim();
+            if (/^(?:git|npm|pnpm|yarn|bun|node|cargo|go|python|bash|sh|zsh)\\s/i.test(rawPrefix)) return null;
+            if (/["'<>|?*]/.test(rawPrefix)) return null;
+            if (/\\s-[a-zA-Z]/.test(rawPrefix)) return null;
+            const isCategory = /^(?:All files|Added|Deleted|Modified|Untracked)$/i.test(rawPrefix);
+            const hasExtension = /\\.[a-zA-Z0-9_-]{1,12}$/i.test(rawPrefix);
+            const hasPathSep = /[\\/\\\\]/.test(rawPrefix);
+            if (isCategory || hasExtension || hasPathSep) {
+                const tag = fileStatusMatch[2].toLowerCase();
+                const tagMap = {
+                    'uncommitted': '(未提交)',
+                    'unstaged': '(未暂存)',
+                    'staged': '(已暂存)',
+                    'untracked': '(未跟踪)',
+                    'modified': '(已修改)',
+                    'deleted': '(已删除)',
+                    'added': '(已添加)',
+                    'all agent edits': '(智能体的所有修改)',
+                    'agent edits': '(智能体修改)'
+                };
+                if (tagMap[tag]) {
+                    const translatedPrefix = map.get(rawPrefix)
+                        || lowerMap.get(rawPrefix.toLowerCase())
+                        || rawPrefix;
+                    return translatedPrefix + " " + tagMap[tag];
+                }
+            }
+        }
+        return null;
+    }
+
+    function getRelativeTimeTranslation(value) {
+        const normalized = norm(value);
+        let match = normalized.match(/^(\\d+)\\s*(s|m|h|d|w|mo|yr)$/i);
+        if (match) {
+            const compactUnits = {
+                s: "秒前",
+                m: "分钟前",
+                h: "小时前",
+                d: "天前",
+                w: "周前",
+                mo: "个月前",
+                yr: "年前"
+            };
+            return match[1] + compactUnits[match[2].toLowerCase()];
+        }
+
+        // Some Windows builds expose relative timestamps already localized
+        // in Simplified Chinese. Normalize those too so the UI stays Korean.
+        match = normalized.match(/^(\\d+)\\s*(秒|分钟|小时|天|周|个月|年)前$/);
+        if (match) {
+            const units = {
+                '秒': '초 전',
+                '分钟': '분 전',
+                '小时': '시간 전',
+                '天': '일 전',
+                '周': '주 전',
+                '个月': '개월 전',
+                '年': '년 전'
+            };
+            return match[1] + units[match[2]];
+        }
+
+        match = normalized.match(/^(\\d+)\\s*(sec|secs|second|seconds|min|mins|minute|minutes|hr|hrs|hour|hours|day|days|wk|wks|week|weeks|mo|mos|month|months|yr|yrs|year|years)\\s+ago$/i);
+        if (!match) return null;
+
+        const unit = match[2].toLowerCase();
+        let translatedUnit = "";
+        if (/^sec/.test(unit)) translatedUnit = "秒前";
+        else if (/^min/.test(unit)) translatedUnit = "分钟前";
+        else if (/^(?:hr|hour)/.test(unit)) translatedUnit = "小时前";
+        else if (/^day/.test(unit)) translatedUnit = "天前";
+        else if (/^(?:wk|week)/.test(unit)) translatedUnit = "周前";
+        else if (/^mo/.test(unit)) translatedUnit = "个月前";
+        else if (/^(?:yr|year)/.test(unit)) translatedUnit = "年前";
+        return translatedUnit ? match[1] + translatedUnit : null;
+    }
+
+    function getArtifactTimestampTranslation(value) {
+        const normalized = norm(value);
+        let match = normalized.match(/^(.*?)\\s*\\((Today|Yesterday)\\s+(\\d{1,2}):(\\d{2})\\s+(AM|PM)\\)$/i);
+        if (match) {
+            const prefix = match[1].trim();
+            const day = match[2].toLowerCase() === 'today' ? "今天" : "昨天";
+            const period = match[5].toUpperCase() === 'AM' ? "上午" : "下午";
+            const timestamp = "（" + day + " " + period + match[3] + ":" + match[4] + "）";
+            return prefix ? prefix + " " + timestamp : timestamp;
+        }
+
+        match = normalized.match(/^(.*?)\\s*\\((Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+(\\d{1,2})(?:,\\s*(\\d{4}))?\\s+(\\d{1,2}):(\\d{2})\\s+(AM|PM)\\)$/i);
+        if (!match) return null;
+
+        const monthMap = {
+            jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+            jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12
+        };
+        const prefix = match[1].trim();
+        const month = monthMap[match[2].toLowerCase()];
+        const year = match[4] ? match[4] + "年" : "";
+        const period = match[7].toUpperCase() === 'AM' ? "上午" : "下午";
+        const timestamp = "（" + year + month + "月" + match[3] + "日 " + period + match[5] + ":" + match[6] + "）";
+        return prefix ? prefix + " " + timestamp : timestamp;
+    }
+
+    function getCompactCountLabelTranslation(value) {
+        const normalized = norm(value);
+        let match = normalized.match(/^(\\d+)\\s*(?:results?|个结果s?)$/i);
+        if (match) return match[1] + " 个结果";
+
+        match = normalized.match(/^(?:Comments?|评论)\\s*[（(]\\s*(\\d+)\\s*[)）]$/i);
+        if (match) return "评论（" + match[1] + "）";
+
+        match = normalized.match(/^(?:Side Questions?|侧边提问)\\s*[（(]\\s*(\\d+)\\s*[)）]$/i);
+        if (match) return "侧边提问（" + match[1] + "）";
+
+        match = normalized.match(/^(\\d+)\\s+(?:Side\\s+Questions?|个?侧边提问)(?:\\s*([>v›❯〉→∨˅⌄▼▽⋁↓]))?$/i);
+        if (match) return match[1] + " 个侧边提问" + (match[2] ? " " + match[2] : "");
+
+        match = normalized.match(/^(?:Listed|列出了)\\s*(\\d+)\\s*(?:tasks?|个任务\\s*s?)(?:\\s*([>v›❯〉→∨˅⌄▼▽⋁↓]))?$/i);
+        if (match) return "列出了 " + match[1] + " 个任务" + (match[2] ? " " + match[2] : "");
+
+        match = normalized.match(/^[（(]\\s*(\\d+)\\s*(?:subagents?|个?\\s*子智能体s?)\\s*[)）]$/i);
+        if (match) return "（" + match[1] + " 个子智能体）";
+
+        match = normalized.match(/^(?:See all|显示全部|查看全部)\\s*[（(]\\s*(\\d+)\\s*[)）]$/i);
+        if (match) return "显示全部 (" + match[1] + ")";
+        return null;
+    }
+
+    function getWorkingStatusTranslation(value) {
+        const normalized = norm(value).replace(/[\\u200B-\\u200D\\uFEFF]/g, '');
+        if (/^Working(?:\\s*\\.){3}$/i.test(normalized) || /^Working\\s*…$/i.test(normalized)) {
+            return "작업 중...";
+        }
+        if (/^(?:处理中|工作中)(?:(?:\\s*\\.)|(?:\\s*…))+$/i.test(normalized)) {
+            return "작업 중...";
+        }
+        return null;
+    }
+
+    function getSearchingStatusTranslation(value) {
+        if (!value) return null;
+        const normalized = norm(value).replace(/[\\u200B-\\u200D\\uFEFF]/g, '');
+        if (/^Searching(?:\\s*\\.){1,3}$/i.test(normalized) || /^Searching\\s*…$/i.test(normalized) || /^Searching\\s*\\.{3,}$/i.test(normalized) || /^Searching$/i.test(normalized)) {
+            return "검색 중...";
+        }
+        if (/^No\\s+suggestions(?:\\.|\\b)/i.test(normalized)) {
+            return "추천 없음";
+        }
+        return null;
+    }
+
+    function getQuotaDurationTranslation(value) {
+        const normalized = norm(value);
+        if (/^less than a minute$/i.test(normalized)) return "不到 1 分钟";
+
+        const parts = normalized.split(/\\s*,\\s*/);
+        if (parts.length < 1 || parts.length > 2) return null;
+        const translated = [];
+        for (const part of parts) {
+            const match = part.match(/^(\\d+)\\s+(days?|hours?|minutes?)$/i);
+            if (!match) return null;
+            const unit = /^day/i.test(match[2]) ? "天" : /^hour/i.test(match[2]) ? "小时" : "分钟";
+            translated.push(match[1] + " " + unit);
+        }
+        return translated.join(" ");
+    }
+
+    function getQuotaNoticeTranslation(value) {
+        const normalized = norm(value);
+        let match = normalized.match(/^You have hit your weekly limit, it refreshes in (.+?)\\. If on a supported paid plan, you can use AI credits in the interim or upgrade to a higher tier\\.?$/i);
+        if (match) {
+            const duration = getQuotaDurationTranslation(match[1]);
+            if (duration) {
+                return "您已达到每周配额限制，将在 " + duration + "后刷新。如果使用的是受支持的付费计划，您可以在此期间使用 AI 额度，或升级到更高等级的套餐";
+            }
+        }
+
+        match = normalized.match(/^You have hit your weekly limit, the 5-hour limit does not currently apply\\. Your weekly limit will fully refresh in (.+?)\\.?$/i);
+        if (match) {
+            const duration = getQuotaDurationTranslation(match[1]);
+            if (duration) {
+                return "您已达到每周配额限制，因此当前不适用 5 小时配额限制。您的每周配额将在 " + duration + "后完全刷新";
+            }
+        }
+
+        match = normalized.match(/^您已达到每周配额限制，将在 (.+?)后刷新。如果使用的是受支持的付费计划，您可以在此期间使用 AI 额度，或升级到更高等级的套餐。?$/);
+        if (match) {
+            const duration = getQuotaDurationTranslation(match[1]);
+            if (duration) {
+                return "您已达到每周配额限制，将在 " + duration + "后刷新。如果使用的是受支持的付费计划，您可以在此期间使用 AI 额度，或升级到更高等级的套餐";
+            }
+        }
+
+        match = normalized.match(/^您已达到每周配额限制，因此当前不适用 5 小时配额限制。您的每周配额将在 (.+?)后完全刷新。?$/);
+        if (match) {
+            const duration = getQuotaDurationTranslation(match[1]);
+            if (duration) {
+                return "您已达到每周配额限制，因此当前不适用 5 小时配额限制。您的每周配额将在 " + duration + "后完全刷新";
+            }
+        }
+        return null;
+    }
+
+    function isInSkillItemContext(node) {
+        let current = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+        for (let depth = 0; current && depth < 4; depth++) {
+            if (current === document.body || current === document.documentElement) break;
+            const text = current.textContent || '';
+            if (text.length <= 400 && /(?:^|[\\\\s])(?:\\\\.{2,3})?[^\\\\s]+[\\\\/\\\\]skills[\\\\/\\\\][^\\\\s]+/i.test(text)) {
+                return true;
+            }
+            current = current.parentElement || (current.getRootNode?.().host ?? null);
+        }
+        return false;
+    }
+
+    function isInBlockedZone(node) {
+        if (isInSkillItemContext(node)) return true;
+        let curr = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+        while (curr) {
+            if (curr.nodeType === Node.ELEMENT_NODE) {
+                if (curr.hasAttribute(SKIP_TRANSLATION_ATTR)) return true;
+                if (BLOCKED_TEST_IDS.has(curr.getAttribute('data-testid'))) return true;
+
+                const tag = curr.tagName.toUpperCase();
+                if (BLOCKED_TAGS.includes(tag)) return true;
+                if (curr.getAttribute('contenteditable') === 'true') return true;
+
+                const className = curr.className || '';
+                if (typeof className === 'string') {
+                    if (BLOCKED_CLASSES.some(cls => className.includes(cls))) return true;
+                }
+            }
+            curr = curr.parentElement || (curr.parentNode && curr.parentNode.host);
+        }
+        return false;
+    }
+
+    // The product-owned attachment label is rendered inside the protected
+    // user-input container. Match its exact source structure so user text,
+    // comment bodies, file names, and other descendants remain untouched.
+    function getProtectedProductUiTranslation(node, value) {
+        const normalized = norm(value);
+        const lower = normalized.toLowerCase();
+
+        if (lower === 'commented on:') {
+            const label = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+            if (!label || label.tagName?.toUpperCase() !== 'SPAN') return null;
+
+            const labelClass = typeof label.className === 'string' ? label.className : '';
+            if (!labelClass.includes('text-sm') || !labelClass.includes('text-secondary-foreground')) return null;
+
+            const row = label.parentElement;
+            const rowClass = typeof row?.className === 'string' ? row.className : '';
+            if (!rowClass.includes('items-center') || !rowClass.includes('flex-wrap')) return null;
+
+            let current = row;
+            let userInput = null;
+            while (current) {
+                if (current.getAttribute?.('data-testid') === 'user-input-step') {
+                    userInput = current;
+                    break;
+                }
+                current = current.parentElement || (current.getRootNode?.().host ?? null);
+            }
+            if (!userInput) return null;
+
+            if (map.has(normalized)) return map.get(normalized);
+            return lowerMap.get(lower) ?? null;
+        }
+
+        let searchingContainer = null;
+        let p = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+        for (let depth = 0; p && depth < 4; depth++) {
+            const pText = norm(p.textContent);
+            if (/^Searching(?:\\s*\\.){1,3}$/i.test(pText) || /^Searching\\s*…$/i.test(pText)) {
+                searchingContainer = p;
+                break;
+            }
+            if (!searchingContainer && getSearchingStatusTranslation(pText)) {
+                searchingContainer = p;
+            }
+            p = p.parentElement || (p.parentNode && p.parentNode.host);
+        }
+
+        const searchingTrans = (searchingContainer ? getSearchingStatusTranslation(searchingContainer.textContent) : null)
+            || getSearchingStatusTranslation(value);
+        if (searchingTrans) {
+            let current = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+            let inTerminal = false;
+            let inCodeLine = false;
+            let inPreOrCode = false;
+
+            while (current) {
+                if (current.nodeType === Node.ELEMENT_NODE) {
+                    const tag = current.tagName?.toUpperCase();
+                    if (tag === 'CODE' || tag === 'PRE') inPreOrCode = true;
+                    const className = typeof current.className === 'string' ? current.className : '';
+                    if (className.includes('terminal') || className.includes('xterm') || className.includes('output-view') || className.includes('debug-console')) inTerminal = true;
+                    if (className.includes('view-line')) inCodeLine = true;
+                }
+                current = current.parentElement || (current.parentNode && current.parentNode.host);
+            }
+
+            if (!inTerminal && !inCodeLine && !inPreOrCode) {
+                const targetContainer = searchingContainer || node.parentElement;
+                if (targetContainer && norm(targetContainer.textContent) !== norm(value)) {
+                    const siblings = collectTextNodes(targetContainer);
+                    const searchingIdx = siblings.findIndex(t => /Searching|正在搜索/i.test(norm(t.nodeValue)));
+                    if (searchingIdx >= 0) {
+                        for (let i = 0; i < siblings.length; i++) {
+                            if (siblings[i] !== node) {
+                                replaceTextNode(siblings[i], i === searchingIdx ? searchingTrans : '');
+                            }
+                        }
+                    }
+                }
+                return searchingTrans;
+            }
+        }
+
+        return null;
+    }
+
+    function isInCommentContext(node) {
+        let current = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+        for (let depth = 0; current && depth < 10; depth++) {
+            if (current === document.body || current === document.documentElement) break;
+            const text = norm(current.textContent);
+            if (text.length <= 6000 && /(?:Comments?|评论)\\s*[（(]\\s*\\d+\\s*[)）]/i.test(text)) return true;
+            if (text.length <= 2000 && /(?:Save Comment|保存评论|Submit comment|提交评论|Add Comment|添加评论)/i.test(text)) return true;
+            current = current.parentElement || (current.getRootNode?.().host ?? null);
+        }
+        return false;
+    }
+
+    function hasRelativeTimeDescendant(element) {
+        const pending = Array.from(element?.childNodes || []);
+        while (pending.length > 0) {
+            const current = pending.pop();
+            if (current.nodeType === Node.TEXT_NODE) {
+                const text = norm(current.nodeValue);
+                if (/^(?:\\d+\\s*(?:s|m|h|d|w|mo|yr)|\\d+\\s*(?:secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|wks?|weeks?|mos?|months?|yrs?|years?)\\s+ago|\\d+\\s*(?:秒|分钟|小时|天|周|个月|年)前)$/i.test(text)) {
+                    return true;
+                }
+                continue;
+            }
+            if (current.childNodes) pending.push(...current.childNodes);
+        }
+        return false;
+    }
+
+    function isInConversationTimestampContext(node) {
+        let current = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+        for (let depth = 0; current && depth < 10; depth++) {
+            if (current === document.body || current === document.documentElement) break;
+
+            const metadata = [
+                current.className,
+                current.getAttribute?.('id'),
+                current.getAttribute?.('data-testid'),
+                current.getAttribute?.('aria-label'),
+                current.getAttribute?.('title')
+            ].filter(valuePart => typeof valuePart === 'string').join(' ');
+            if (/(?:^|[-_\\s])(?:conversation|cascade)(?:[-_\\s]|$)/i.test(metadata)) return true;
+
+            const text = norm(current.textContent);
+            if (text.length <= 20000) {
+                const hasConversationSections =
+                    /(?:Other Conversations|其他会话)/i.test(text) &&
+                    /(?:Current|当前|Search all conversations|搜索所有会话)/i.test(text);
+                if (hasConversationSections) return true;
+
+                if (hasRelativeTimeDescendant(current)) return true;
+            }
+            current = current.parentElement || (current.getRootNode?.().host ?? null);
+        }
+        return false;
+    }
+
+    function getTimestampNowTranslation(node, value) {
+        const normalized = norm(value);
+        if (!/^now$/i.test(normalized)) return null;
+
+        let current = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+        let timestampLike = false;
+        let explicitTimestamp = false;
+        let timestampElement = null;
+        let compactRow = null;
+        for (let depth = 0; current && depth < 3 && norm(current.textContent) === normalized; depth++) {
+            const tag = current.tagName?.toUpperCase();
+            const metadata = [
+                current.className,
+                current.getAttribute?.('data-testid'),
+                current.getAttribute?.('aria-label'),
+                current.getAttribute?.('title')
+            ].filter(valuePart => typeof valuePart === 'string').join(' ');
+            if (tag === 'TIME' || current.hasAttribute?.('datetime') || /(?:^|[-_\\s])(?:time|timestamp|date|muted|secondary|caption)(?:[-_\\s]|$)|(?:^|\\s)text-xs(?:\\s|$)/i.test(metadata)) {
+                timestampLike = true;
+                explicitTimestamp = tag === 'TIME' || current.hasAttribute?.('datetime') || /(?:^|[-_\\s])(?:time|timestamp|date)(?:[-_\\s]|$)/i.test(metadata);
+                timestampElement = current;
+                break;
+            }
+            current = current.parentElement || (current.getRootNode?.().host ?? null);
+        }
+        if (timestampLike && (explicitTimestamp || isInCommentContext(node))) return "刚刚";
+
+        current = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+        for (let depth = 0; current && depth < 5; depth++) {
+            const text = norm(current.textContent);
+            if (text !== normalized) {
+                if (text.length <= 240) compactRow = current;
+                break;
+            }
+            current = current.parentElement || (current.getRootNode?.().host ?? null);
+        }
+
+        // Conversation rows render the title and a muted relative timestamp as
+        // siblings or nested cells. Require both that compact row and a nearby
+        // conversation-list signal so ordinary standalone "now" stays intact.
+        if (!compactRow || !isInConversationTimestampContext(node)) return null;
+        if (timestampLike && timestampElement?.parentElement === compactRow) return "刚刚";
+        return norm(compactRow.textContent) !== normalized ? "刚刚" : null;
+    }
+
+    function getRecentProjectSectionTranslation(node, value) {
+        const normalized = norm(value);
+        const match = normalized.match(/^Recent in\\s+(.+)$/i);
+        if (!match || match[1].length > 160 || !isInConversationTimestampContext(node)) return null;
+        return match[1] + " 中的近期会话";
+    }
+
+    function isInDeleteTaskDialogContext(node) {
+        let current = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+        for (let depth = 0; current && depth < 10; depth++) {
+            if (current === document.body || current === document.documentElement) break;
+            const text = norm(current.textContent);
+            const hasTitle = /(?:Delete Task|删除任务)/i.test(text);
+            const hasConfirmation = /Are you sure you want to delete|This action cannot be undone|您确定要删除(?:计划)?任务|此操作无法撤销/i.test(text);
+            if (text.length <= 1600 && hasTitle && hasConfirmation) return true;
+            current = current.parentElement || (current.getRootNode?.().host ?? null);
+        }
+        return false;
+    }
+
+    function getDeleteTaskConfirmationTranslation(node, value) {
+        const normalized = norm(value);
+        if (!/^Are you sure you want to delete/i.test(normalized) && !/^\\?/i.test(normalized)) return null;
+        if (!isInDeleteTaskDialogContext(node)) return null;
+
+        let match = normalized.match(/^Are you sure you want to delete(?:\\s+the scheduled task)?\\s+(.+?)\\?\\s*(?:This action cannot be undone\\.?|此操作无法撤销。?)$/i);
+        if (match) return "您确定要删除任务 " + match[1] + " 吗？此操作无法撤销";
+
+        match = normalized.match(/^Are you sure you want to delete(?:\\s+the scheduled task)?(?:\\s+(.+))?$/i);
+        if (match) return "您确定要删除任务" + (match[1] ? " " + match[1] : " ");
+
+        if (/^\\?\\s*(?:This action cannot be undone\\.?|此操作无法撤销。?)?$/i.test(normalized)) {
+            return /(?:This action cannot be undone|此操作无法撤销)/i.test(normalized)
+                ? " 吗？此操作无法撤销"
+                : " 吗？";
+        }
+        return null;
+    }
+
+    function findLastTextNode(node) {
+        if (!node) return null;
+        if (node.nodeType === Node.TEXT_NODE) {
+            return node.nodeValue && node.nodeValue.trim() ? node : null;
+        }
+        if (!node.childNodes) return null;
+        for (let i = node.childNodes.length - 1; i >= 0; i--) {
+            const found = findLastTextNode(node.childNodes[i]);
+            if (found) return found;
+        }
+        return null;
+    }
+
+    function findPreviousTextNode(node) {
+        let current = node;
+        while (current) {
+            if (current === document.body || current === document.documentElement) break;
+            let sibling = current.previousSibling;
+            while (sibling) {
+                const found = findLastTextNode(sibling);
+                if (found) return found;
+                sibling = sibling.previousSibling;
+            }
+            current = current.parentNode || current.host || null;
+        }
+        return null;
+    }
+
+    function isReasoningBodyNode(node) {
+        if (!node) return false;
+        let current = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+        for (let depth = 0; current && depth < 8; depth++) {
+            if (current === document.body || current === document.documentElement) break;
+
+            const isHeader = current.matches?.('button, [role="button"]')
+                && /^(?:Thinking|Thought)\s+for\s+/i.test(norm(current.textContent));
+            if (isHeader) return false;
+
+            const header = Array.from(current.querySelectorAll?.('button, [role="button"]') || [])
+                .find(candidate => /^(?:Thinking|Thought)\s+for\s+/i.test(norm(candidate.textContent)));
+            if (header) return !header.contains(node);
+
+            current = current.parentElement || (current.getRootNode?.().host ?? null);
+        }
+        return false;
+    }
+
+    const CONTEXT_MENU_TRANSLATIONS = new Map([
+        ['Rename', '이름 바꾸기'],
+        ['Mark Unread', '읽지 않음으로 표시'],
+        ['Mark Read', '읽음으로 표시'],
+        ['Copy', '복사'],
+        ['Fork', '분기'],
+        ['Split', '분할'],
+        ['Share', '공유'],
+        ['View Debug', '디버그 보기'],
+        ['Archive', '보관'],
+        ['Unarchive', '보관 해제'],
+        ['Delete', '삭제'],
+        ['Open', '열기'],
+        ['Open in New Window', '새 창에서 열기'],
+        ['Copy Link', '링크 복사'],
+        ['Copy Path', '경로 복사'],
+        ['Split Right', '오른쪽으로 분할'],
+        ['Split Down', '아래로 분할']
+    ]);
+
+    const CHROME_UI_TRANSLATIONS = new Map([
+        ['File', '파일'],
+        ['View', '보기'],
+        ['Window', '창'],
+        ['Automations', '예약된 작업'],
+        ['Local', '로컬'],
+        ['More options', '추가 옵션'],
+        ['Project options', '프로젝트 옵션'],
+        ['Record voice memo', '음성 메모 녹음']
+    ]);
+
+    function getChromeUiTranslation(node, value) {
+        const normalized = norm(value);
+        let current = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+        const element = current?.closest?.('[data-testid], button, [role="button"]') || current;
+        const testId = element?.getAttribute?.('data-testid') || '';
+        const ariaLabel = element?.getAttribute?.('aria-label') || '';
+
+        if (testId === 'title-menu-bar-item') {
+            return CHROME_UI_TRANSLATIONS.get(normalized) || null;
+        }
+        if (normalized === 'Automations' && testId === 'automations-button') return '예약된 작업';
+        if (normalized === 'Local' && ariaLabel === '환경 선택') return '로컬';
+        if (normalized === 'More options' && testId === 'conversation-kebab') return '추가 옵션';
+        if (normalized === 'Project options') return '프로젝트 옵션';
+        if (normalized === 'Record voice memo') return '음성 메모 녹음';
+        if (/^Select project, current:\s*/i.test(normalized)) {
+            return normalized.replace(/^Select project, current:\s*/i, '프로젝트 선택, 현재: ');
+        }
+        if (/^Select model, current:\s*/i.test(normalized)) {
+            return normalized.replace(/^Select model, current:\s*/i, '모델 선택, 현재: ');
+        }
+        if (ariaLabel === value && CHROME_UI_TRANSLATIONS.has(normalized)) {
+            return CHROME_UI_TRANSLATIONS.get(normalized);
+        }
+        return null;
+    }
+
+    function getContextMenuTranslation(node, value) {
+        const translated = CONTEXT_MENU_TRANSLATIONS.get(norm(value));
+        if (!translated) return null;
+
+        const conversationMenuItems = [
+            ['Rename', '이름 바꾸기'],
+            ['Mark Unread', '읽지 않음으로 표시'],
+            ['Mark Read', '읽음으로 표시'],
+            ['Copy', '복사'],
+            ['Split', '분할'],
+            ['Archive', '보관'],
+            ['Unarchive', '보관 해제'],
+            ['Delete', '삭제']
+        ];
+
+        let current = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+        for (let depth = 0; current && depth < 10; depth++) {
+            const role = current.getAttribute?.('role');
+            const className = typeof current.className === 'string' ? current.className : '';
+            const currentText = norm(current.textContent || '');
+            const isInteractive = current.matches?.('button, [tabindex], [aria-haspopup], [aria-expanded]');
+            const menuItemMatches = conversationMenuItems.filter(([english, korean]) => {
+                return currentText.includes(english) || currentText.includes(korean);
+            }).length;
+            if (isInteractive || role === 'menu' || role === 'menuitem' || role === 'menuitemcheckbox' ||
+                /(?:context-menu|dropdown-menu)/i.test(className) ||
+                current.hasAttribute?.('data-radix-menu-content') ||
+                menuItemMatches >= 4) {
+                return translated;
+            }
+            current = current.parentElement || (current.getRootNode?.().host ?? null);
+        }
+        return null;
+    }
+
+    function replaceTextNode(node, value) {
+        if (!node) return false;
+        if (containsHan(value)) {
+            const normalizedValue = norm(value);
+            const mappedValue = map.get(normalizedValue)
+                || lowerMap.get(normalizedValue.toLowerCase());
+            if (mappedValue && !containsHan(mappedValue)) {
+                value = mappedValue;
+            } else if (!containsHan(node.nodeValue || '')) {
+                // Legacy helper output can still be Chinese. Preserve the
+                // original English/Korean node when no safe Korean mapping
+                // exists so no Chinese text leaks into the visible UI.
+                value = node.nodeValue || '';
+            }
+        }
+        translatedValues.set(node, value);
+        if (node.nodeValue === value) return false;
+        node.nodeValue = value;
+        return true;
+    }
+
+    const EXPLORED_STATUS_SUFFIX = '[>v›∨˅⌄▼▽⋁\\u2228\\u02c5\\u2304\\u25bc\\u25bd\\u276f\\u2193]';
+
+    function getExploredStatusUnit(type) {
+        const normalizedType = String(type || '').toLowerCase();
+        if (/^files?$/.test(normalizedType)) return "个文件";
+        if (/^folders?$/.test(normalizedType)) return "个文件夹";
+        if (/^pages?$/.test(normalizedType)) return "个页面";
+        if (/^search(?:es)?$/.test(normalizedType)) return "次搜索";
+        if (/^tasks?$/.test(normalizedType)) return "个任务";
+        if (/^commands?$/.test(normalizedType)) return "条命令";
+        if (/^tools?$/.test(normalizedType)) return "个工具";
+        if (/^rules?$/.test(normalizedType)) return "条规则";
+        if (/^repos(?:itories)?$/.test(normalizedType)) return "个仓库";
+        if (/^images?$/.test(normalizedType)) return "张图片";
+        if (/^actions?$/.test(normalizedType)) return "次操作";
+        return null;
+    }
+
+    function translateExploredStatus(str) {
+        if (!str || typeof str !== 'string') return null;
+        const trimmed = str.trim();
+        const match = trimmed.match(new RegExp('^(?:(Explored)\\\\s+)?(.+?)(\\\\s*' + EXPLORED_STATUS_SUFFIX + ')?\\\\s*$', 'i'));
+        if (!match) return null;
+
+        const rawContent = match[2].trim().replace(/,\\s*$/, '');
+        const items = rawContent.split(/\\s*,\\s*/);
+        const exploredItems = [];
+        const ranItems = [];
+
+        for (const item of items) {
+            const itemMatch = item.trim().match(/^(?:(ran|run|executed)\\s+)?(\\d+)\\s+(files?|folders?|pages?|search(?:es)?|tasks?|commands?|tools?|rules?|repos(?:itories)?|images?|actions?)$/i);
+            if (!itemMatch) return null;
+            const verb = itemMatch[1];
+            const count = itemMatch[2];
+            const unit = getExploredStatusUnit(itemMatch[3]);
+            if (!unit) return null;
+
+            if (verb) {
+                ranItems.push("运行了 " + count + " " + unit);
+            } else {
+                exploredItems.push(count + " " + unit);
+            }
+        }
+
+        const parts = [];
+        if (exploredItems.length > 0) {
+            const expPrefix = match[1] ? "探索了 " : "";
+            parts.push(expPrefix + exploredItems.join("、"));
+        }
+        if (ranItems.length > 0) {
+            parts.push(ranItems.join("、"));
+        }
+
+        if (parts.length === 0) return null;
+        return parts.join("，") + (match[3] || "");
+    }
+
+    function collectTextNodes(element) {
+        const nodes = [];
+        if (!element || !element.childNodes) return nodes;
+        const visit = current => {
+            if (current.nodeType === Node.TEXT_NODE) {
+                nodes.push(current);
+                return;
+            }
+            if (!current.childNodes) return;
+            for (const child of current.childNodes) visit(child);
+        };
+        visit(element);
+        return nodes;
+    }
+
+    // The commit-dialog summary is split around its file count, arrow icon,
+    // and branch name. Reorder only the text nodes in that bounded row; keep
+    // the icon and runtime Git ref nodes intact.
+    function translateCommitSummaryContainer(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
+        if ((element.textContent || '').length > 240) return false;
+
+        const isElementBlocked = isInBlockedZone(element);
+        const textNodes = collectTextNodes(element);
+        if (textNodes.length < 2) return false;
+
+        const isBlocked = isElementBlocked || textNodes.some(textNode => isInBlockedZone(textNode));
+        let parts = getCommitSummaryParts(textNodes.map(textNode => textNode.nodeValue || '').join(''));
+
+        const nonEmptyIndexes = textNodes
+            .map((textNode, index) => norm(textNode.nodeValue) ? index : -1)
+            .filter(index => index >= 0);
+        if (nonEmptyIndexes.length < 2) return false;
+
+        const lastNonEmptyVal = norm(textNodes[nonEmptyIndexes[nonEmptyIndexes.length - 1]].nodeValue);
+        if (/^(?:to|changes?|更改|files?|个文件)$/i.test(lastNonEmptyVal)) {
+            return false;
+        }
+
+        // React may update only the count or restore one English fragment
+        // after this row was translated. Recover the current count from that
+        // bounded intermediate node, then clear only known source fragments.
+        if (!parts) {
+            const prefixIndex = nonEmptyIndexes[0];
+            const targetIndex = nonEmptyIndexes[nonEmptyIndexes.length - 1];
+            const prefixMatch = norm(textNodes[prefixIndex].nodeValue)
+                .match(/^将\\s*(\\d+)\\s*个文件的更改提交到$/);
+            const intermediateNodes = textNodes.slice(prefixIndex + 1, targetIndex);
+            const hasOnlyCommitFragments = intermediateNodes.every(textNode => {
+                const text = norm(textNode.nodeValue);
+                return !text || /^(?:\\d+|to|changes?|更改|files?|个文件|↗|↑)$/i.test(text);
+            });
+            if (prefixMatch && hasOnlyCommitFragments) {
+                const refreshedCount = intermediateNodes
+                    .map(textNode => norm(textNode.nodeValue))
+                    .find(text => /^\\d+$/.test(text));
+                parts = {
+                    count: refreshedCount || prefixMatch[1],
+                    target: norm(textNodes[targetIndex].nodeValue)
+                };
+            }
+        }
+        if (!parts) return false;
+
+        if (isBlocked) {
+            return 'skipped';
+        }
+
+        // Prefer the smallest matching container so sibling rows cannot be
+        // combined when their parent happens to have no additional text.
+        if (Array.from(element.children || []).some(child => {
+            const childNodes = collectTextNodes(child);
+            return childNodes.length > 1 &&
+                !childNodes.some(textNode => isInBlockedZone(textNode)) &&
+                !!getCommitSummaryParts(childNodes.map(textNode => textNode.nodeValue || '').join(''));
+        })) return false;
+
+        const prefixIndex = nonEmptyIndexes[0];
+        const targetIndex = nonEmptyIndexes[nonEmptyIndexes.length - 1];
+        let changed = replaceTextNode(textNodes[prefixIndex], "将 " + parts.count + " 个文件的更改提交到 ");
+        for (let index = prefixIndex + 1; index < targetIndex; index++) {
+            // Some builds render the outbound-arrow glyph as text rather than
+            // SVG. It is product UI, so preserve it just like the icon form.
+            if (/^[↗↑]$/.test(norm(textNodes[index].nodeValue))) continue;
+            changed = replaceTextNode(textNodes[index], '') || changed;
+        }
+        return true;
+    }
+
+    function translateCommitSummaryTextNode(node, value) {
+        const normalized = norm(value);
+        if (!/^(?:Commit|提交|to|changes?|更改|files?|个文件|\\d+)$/i.test(normalized)) return false;
+
+        if (/^\\d+$/.test(normalized)) {
+            let countContext = node.parentElement;
+            let hasCommitContext = false;
+            for (let depth = 0; countContext && depth < 5; depth++) {
+                if (countContext === document.body || countContext === document.documentElement) break;
+                if ((countContext.childNodes?.length || 0) > 24) break;
+                const contextText = norm(countContext.textContent);
+                if (contextText.length <= 240 &&
+                    /^(?:Commit|提交|将\\s*\\d+\\s*个文件的更改提交到)/i.test(contextText) &&
+                    /(?:files?\\s*changes?|个文件.*更改)/i.test(contextText)) {
+                    hasCommitContext = true;
+                    break;
+                }
+                countContext = countContext.parentElement || (countContext.getRootNode?.().host ?? null);
+            }
+            if (!hasCommitContext) return false;
+        }
+
+        let current = node.parentElement;
+        for (let depth = 0; current && depth < 5; depth++) {
+            if (current === document.body || current === document.documentElement) break;
+            if ((current.childNodes?.length || 0) > 24) break;
+            const res = translateCommitSummaryContainer(current);
+            if (res) return true;
+            current = current.parentElement || (current.getRootNode?.().host ?? null);
+        }
+        return false;
+    }
+
+    const SKILL_PICKER_DISPLAY_ENTRIES = [
+        {
+            source: 'btw',
+            display: "Quick Questions",
+            descriptions: [
+                'Ask a quick question without interrupting the main conversation.',
+                "在不中断主会话的情况下快速提问"
+            ]
+        },
+        {
+            source: 'grill-me',
+            display: "Grill Me",
+            descriptions: [
+                'Interview me to align on a plan',
+                'Interview me to align on a plan.',
+                "通过访谈与我对齐方案"
+            ]
+        },
+        {
+            source: 'teamwork-preview',
+            display: "Teamwork (Preview)",
+            descriptions: [
+                'Invoke a team of agents to autonomously tackle large projects',
+                'Invoke a team of agents to autonomously tackle large projects.',
+                "调用智能体团队自主应对大型项目"
+            ]
+        },
+        {
+            source: 'learn',
+            display: "Learn",
+            descriptions: [
+                'Reflect on recent successes or corrections to capture reusable skills or rules.',
+                "反思最近的成功或改进，以捕获可复用的技能或规则"
+            ]
+        },
+        {
+            source: 'boost',
+            display: "Boost",
+            descriptions: [
+                'Invoke the Boost multi-agent orchestrator for complex tasks',
+                'Invoke the Boost multi-agent orchestrator for complex tasks.',
+                "调用 Boost 多智能体编排器处理复杂任务"
+            ]
+        },
+        {
+            source: 'agy-customizations',
+            display: "Antigravity Customizations",
+            descriptions: [
+                'Comprehensive guide and reference for the Antigravity Customization System.',
+                "Antigravity 个性化定制系统的综合指南与参考资料"
+            ]
+        },
+        {
+            source: 'antigravity-guide',
+            display: "Antigravity Guide",
+            descriptions: [
+                'Provides a comprehensive guide, quick reference, and sitemap for Google Antigravity (AGY), including the Antigravity CLI (agy), Antigravity 2.0, Antigravity IDE, Python SDK, slash commands, keybindings, and customizations (skills, rules, MCP, sidecars).',
+                "为 Google Antigravity（AGY）提供全面指南、快速参考和网站地图，涵盖 Antigravity CLI（agy）、Antigravity 2.0、Antigravity IDE、Python SDK、斜杠命令、快捷键及个性化定制（技能、规则、MCP 和 Sidecar）"
+            ]
+        },
+        {
+            source: 'generative_ui',
+            display: "Generative UI",
+            descriptions: [
+                'How to render rich interactive HTML widgets inline in the chat or as standalone artifacts. Use this skill when you want to show the user diagrams, data visualizations, interactive controls, educational walkthroughs, or any rich visual content beyond plain text and markdown.',
+                "介绍如何在会话中以内嵌方式呈现丰富的交互式 HTML 小组件，或将其作为独立交付件呈现。当您需要向用户展示图示、数据可视化、交互控件、教学演示，或任何超出纯文本和 Markdown 范畴的丰富可视化内容时，请使用此技能"
+            ]
+        },
+        {
+            source: 'migrate-workflows',
+            display: "Migrate Workflows",
+            descriptions: [
+                'Automatically migrate legacy workflows to modern skills across global and workspace configurations. Scans for existing workflows, creates target SKILL.md files, and safely archives old workflow files.',
+                'Automatically migrate legacy workflows to modern skills across global and workspace configurations.',
+                "自动跨全局和工作区配置将旧版工作流迁移至现代技能。扫描现有工作流，创建目标 SKILL.md 文件，并安全归档旧工作流文件",
+                "自动跨全局和工作区配置将旧版工作流迁移至现代技能"
+            ]
+        },
+        {
+            source: 'permissioned-github',
+            display: "Permissioned GitHub",
+            descriptions: [
+                'Guidelines for interacting with GitHub and request permissions from the user when commands fail due to restrictions in the agent environment.',
+                'Guidelines for interacting with GitHub and request permissions from the user when commands fail due to restrictions in the agent environment',
+                "与 GitHub 交互的操作准则，并在命令因智能体环境限制而失败时向用户申请权限"
+            ]
+        },
+        {
+            source: 'automation',
+            display: "Scheduled Automation",
+            descriptions: [
+                'Interactive guide to design and create a scheduled background automation. Use this skill when the user wants to create an automated or recurring scheduled task (e.g. "summarize my emails every morning", "every Monday send me a to-do list"). Also triggered by the /automation slash command.',
+                'Interactive guide to design and create a scheduled background automation.',
+                'Interactive guide to design and create a scheduled background automation',
+                "交互式设计并创建定时后台自动化的指引。当用户希望创建自动化或周期性计划任务（例如“每天早上汇总我的邮件”、“每周一向我发送待办清单”）时使用此技能。亦可通过 /automation 斜杠命令触发",
+                "交互式设计并创建定时后台自动化的指引"
+            ]
+        },
+        {
+            source: 'plugin',
+            display: "Plugin Management",
+            descriptions: [
+                "How to manage and create plugins — namespaced bundles of skills, agents, rules, MCP servers and hooks that install, enable and disable as a single unit. Use this skill when the user wants to enable, disable, install or uninstall a plugin, when they want to create a new plugin, or when a new customization should be packaged into a plugin rather than left loose. Also triggered by the /plugin slash command. Don't use for the underlying customization system itself — discovery roots, loading priority, or authoring a standalone skill, agent, rule, hook or MCP server outside a plugin; see the customizations guide skill for those.",
+                "How to manage and create plugins — namespaced bundles of skills, agents, rules, MCP servers and hooks that install, enable and disable as a single unit.",
+                "How to manage and create plugins -- namespaced bundles of skills, agents, rules, MCP servers and hooks that install, enable and disable as a single unit.",
+                "How to manage and create plugins",
+                "如何管理和创建插件 —— 作为单一单元进行安装、启用与禁用的命名空间技能、智能体、规则、MCP 服务器与钩子捆绑包。当用户希望启用、禁用、安装或卸载插件，想要创建新插件，或应当将新的个性化定制打包为插件而非单独留存时使用此技能。亦可通过 /plugin 斜杠命令触发。请勿用于底层个性化定制系统本身 —— 发现根目录、加载优先级，或在插件外部编写独立的技能、智能体、规则、钩子或 MCP 服务器；相关内容请参阅个性化定制指南技能",
+                "如何管理和创建插件 —— 作为单一单元进行安装、启用与禁用的命名空间技能、智能体、规则、MCP 服务器与钩子捆绑包",
+                "如何管理和创建插件"
+            ]
+        },
+        {
+            source: 'ui-extension',
+            display: "UI Extension",
+            descriptions: [
+                "Build, package, run, and debug UI extensions for Antigravity: interactive web panels that render in the side pane, served by a Node.js sidecar using the built-in Sidecar SDK.",
+                "构建、打包、运行并调试 Antigravity 的 UI 扩展：在侧边面板中渲染的交互式 Web 面板，由使用内置 Sidecar SDK 的 Node.js Sidecar 提供服务"
+            ]
+        },
+        {
+            source: 'ui-plugin-navigation',
+            display: "UI Plugin Navigation",
+            descriptions: [
+                "Discover UI plugin panels relevant to the current task and surface a one-click pill in chat to open (toggle) them in the side pane. Use when a running UI plugin's panel would help with what the user is doing, or right after the user enables a new UI plugin pane and a shortcut to open it is handy.",
+                "发现与当前任务相关的 UI 插件面板，并在聊天中提供一键胶囊按钮以便在侧边面板中打开（切换）它们。当运行中的 UI 插件面板对用户正在进行的操作有所帮助，或在用户启用新的 UI 插件面板且需要便捷快捷方式打开它时使用"
+            ]
+        },
+        {
+            source: 'research',
+            display: "Research",
+            descriptions: [
+                "Research subagent with read-only tools for exploring the codebase, searching the web, and reading files. Delegate to this agent when you need to run a task in a separate conversation context but with the same capabilities as the current agent, when a research task requires many search and file-reading steps that would clutter your context, or when you need a broad survey of the codebase or documentation. Prefer doing research yourself for quick, targeted lookups.",
+                "Research subagent with read-only tools for exploring the codebase, searching the web, and reading files.",
+                "具备只读工具的调研子智能体，用于探索代码库、搜索网络和阅读文件。当您需要在独立的会话上下文中运行具有与当前智能体相同能力的任务、研究任务需要执行大量会使上下文变得混乱的搜索与文件读取步骤，或需要对代码库或文档进行广泛调研时，请委托给该智能体。对于快速、有针对性的查询，建议由主智能体自行完成",
+                "具备只读工具的调研型子智能体，用于探索代码库、搜索网络和阅读文件"
+            ]
+        }
+    ];
+
+    function getSkillPickerDisplayEntry(textNodes) {
+        const values = textNodes.map(textNode => norm(textNode.nodeValue));
+        return SKILL_PICKER_DISPLAY_ENTRIES.find(entry => {
+            const hasName = values.includes(entry.source) || values.includes(entry.display);
+            const hasDescription = entry.descriptions.some(description => {
+                const cleanDesc = description.replace(/[.。]+$/, '');
+                return values.some(value => {
+                    const cleanVal = value.replace(/[.。]+$/, '');
+                    return cleanVal === cleanDesc || cleanVal.includes(cleanDesc);
+                });
+            });
+            return hasName && hasDescription;
+        }) || null;
+    }
+
+    function translateSkillPickerEntry(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE || isInBlockedZone(element)) return false;
+
+        const textNodes = collectTextNodes(element);
+        if (textNodes.length < 2 || textNodes.some(textNode => isInBlockedZone(textNode))) return false;
+        const entry = getSkillPickerDisplayEntry(textNodes);
+        if (!entry) return false;
+
+        if (Array.from(element.children || []).some(child => {
+            return !!getSkillPickerDisplayEntry(collectTextNodes(child));
+        })) return false;
+
+        const nameNode = textNodes.find(textNode => norm(textNode.nodeValue) === entry.source);
+        return nameNode ? replaceTextNode(nameNode, entry.display) : false;
+    }
+
+    function translateSkillPickerNameTextNode(node, value) {
+        const normalized = norm(value);
+        if (!SKILL_PICKER_DISPLAY_ENTRIES.some(entry => entry.source === normalized)) return false;
+
+        // React can replace only the skill-name text node after the row was
+        // translated. The exact-name prefilter keeps this ancestor walk narrow.
+        let current = node.parentElement;
+        for (let depth = 0; current && depth < 4; depth++) {
+            if (translateSkillPickerEntry(current)) return true;
+            current = current.parentElement || (current.getRootNode?.().host ?? null);
+        }
+        return false;
+    }
+
+    function translateAgentLoadingStatus(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE || isInBlockedZone(element)) return false;
+        if (element.getAttribute('data-testid') !== 'agent-loading') return false;
+
+        const textNodes = collectTextNodes(element);
+        if (textNodes.length === 0 || textNodes.some(textNode => isInBlockedZone(textNode))) return false;
+        const prefixNode = textNodes.find(textNode => /^(?:Working|处理中|工作中)$/i.test(norm(textNode.nodeValue)));
+        if (!prefixNode || norm(prefixNode.nodeValue) === "작업 중") return false;
+        return replaceTextNode(prefixNode, (prefixNode.nodeValue || '').replace(/Working|处理中|工作中/i, "작업 중"));
+    }
+
+    function translateWorkingStatusContainer(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE || isInBlockedZone(element)) return false;
+        if (element.getAttribute('data-testid') === 'agent-loading') return false;
+
+        const textNodes = collectTextNodes(element);
+        if (textNodes.length === 0 || textNodes.some(textNode => isInBlockedZone(textNode))) return false;
+        const original = textNodes.map(textNode => textNode.nodeValue || '').join('');
+        const translated = getWorkingStatusTranslation(original);
+        if (!translated || norm(original) === translated) return false;
+
+        if (Array.from(element.children || []).some(child => {
+            return !!getWorkingStatusTranslation(child.textContent || '');
+        })) return false;
+
+        const workingIndex = textNodes.findIndex(textNode => /Working|处理中|工作中/i.test(textNode.nodeValue || ''));
+        if (workingIndex < 0) return false;
+        for (let i = 0; i < textNodes.length; i++) {
+            replaceTextNode(textNodes[i], i === workingIndex ? translated : '');
+        }
+        return true;
+    }
+
+    function translateCompactCountLabelContainer(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE || isInBlockedZone(element)) return false;
+
+        const textNodes = collectTextNodes(element);
+        if (textNodes.length === 0 || textNodes.some(textNode => isInBlockedZone(textNode))) return false;
+        const original = norm(textNodes.map(textNode => textNode.nodeValue || '').join(''));
+        const translated = getCompactCountLabelTranslation(original);
+        if (!translated || translated === original) return false;
+
+        if (Array.from(element.children || []).some(child => {
+            return !!getCompactCountLabelTranslation(child.textContent || '');
+        })) return false;
+
+        if (textNodes.length === 1) return replaceTextNode(textNodes[0], translated);
+
+        const countIndex = textNodes.findIndex(textNode => /^\\s*\\d+\\s*$/.test(textNode.nodeValue || ''));
+        if (countIndex < 0) {
+            const seeAllMatch = original.match(/^(?:See all|显示全部|查看全部)\\s*[（(]\\s*(\\d+)\\s*[)）]$/i);
+            if (seeAllMatch) {
+                replaceTextNode(textNodes[0], "显示全部 (" + seeAllMatch[1] + ")");
+                for (let i = 1; i < textNodes.length; i++) {
+                    replaceTextNode(textNodes[i], '');
+                }
+                return true;
+            }
+            if (/^(?:Listed|列出了)\\s*\\d+/i.test(original)) {
+                const countedTaskIndex = textNodes.findIndex(textNode => {
+                    return /^(\\d+)\\s*(?:tasks?|个任务\\s*s?)(?:\\s*[>v›❯〉→∨˅⌄▼▽⋁↓])?$/i.test(norm(textNode.nodeValue));
+                });
+                if (countedTaskIndex > 0) {
+                    const countedTaskMatch = norm(textNodes[countedTaskIndex].nodeValue).match(/^(\\d+)\\s*(?:tasks?|个任务\\s*s?)(?:\\s*([>v›❯〉→∨˅⌄▼▽⋁↓]))?$/i);
+                    for (let i = 0; i < countedTaskIndex; i++) {
+                        replaceTextNode(textNodes[i], i === countedTaskIndex - 1 ? "列出了 " : '');
+                    }
+                    replaceTextNode(textNodes[countedTaskIndex], countedTaskMatch[1] + " 个任务" + (countedTaskMatch[2] ? " " + countedTaskMatch[2] : ""));
+                    for (let i = countedTaskIndex + 1; i < textNodes.length; i++) {
+                        const trailingArrow = norm(textNodes[i].nodeValue).match(/^[>v›❯〉→∨˅⌄▼▽⋁↓]$/);
+                        replaceTextNode(textNodes[i], trailingArrow ? textNodes[i].nodeValue : '');
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        const count = (textNodes[countIndex].nodeValue || '').trim();
+        const translatedCountIndex = translated.indexOf(count);
+        if (translatedCountIndex < 0) return false;
+        const prefix = translated.slice(0, translatedCountIndex);
+        let suffix = translated.slice(translatedCountIndex + count.length);
+        let trailingMarker = '';
+        if (textNodes.length > countIndex + 2) {
+            const markerMatch = suffix.match(/^(.*?)([）>v›❯〉→∨˅⌄▼▽⋁↓])$/);
+            if (markerMatch) {
+                suffix = markerMatch[1];
+                trailingMarker = markerMatch[2];
+            }
+        }
+
+        for (let i = 0; i < countIndex; i++) {
+            replaceTextNode(textNodes[i], i === countIndex - 1 ? prefix : '');
+        }
+        replaceTextNode(textNodes[countIndex], count);
+        for (let i = countIndex + 1; i < textNodes.length; i++) {
+            let value = i === countIndex + 1 ? suffix : '';
+            if (trailingMarker && i === textNodes.length - 1) value = trailingMarker;
+            replaceTextNode(textNodes[i], value);
+        }
+        return true;
+    }
+
+    function translateQuotaNoticeContainer(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE || isInBlockedZone(element)) return false;
+
+        const textNodes = collectTextNodes(element);
+        if (textNodes.length === 0 || textNodes.some(textNode => isInBlockedZone(textNode))) return false;
+        const original = norm(textNodes.map(textNode => textNode.nodeValue || '').join(''));
+        const translated = getQuotaNoticeTranslation(original);
+        if (!translated || translated === original) return false;
+
+        if (Array.from(element.children || []).some(child => {
+            return !!getQuotaNoticeTranslation(child.textContent || '');
+        })) return false;
+
+        if (textNodes.length === 1) return replaceTextNode(textNodes[0], translated);
+
+        const durationIndex = textNodes.findIndex(textNode => {
+            return !!getQuotaDurationTranslation(textNode.nodeValue || '');
+        });
+        if (durationIndex < 0) return false;
+
+        const translatedDuration = getQuotaDurationTranslation(textNodes[durationIndex].nodeValue || '');
+        const translatedDurationIndex = translated.indexOf(translatedDuration);
+        if (translatedDurationIndex < 0) return false;
+        const prefix = translated.slice(0, translatedDurationIndex);
+        const suffix = translated.slice(translatedDurationIndex + translatedDuration.length);
+
+        for (let i = 0; i < durationIndex; i++) {
+            replaceTextNode(textNodes[i], i === durationIndex - 1 ? prefix : '');
+        }
+        replaceTextNode(textNodes[durationIndex], translatedDuration);
+        for (let i = durationIndex + 1; i < textNodes.length; i++) {
+            replaceTextNode(textNodes[i], i === durationIndex + 1 ? suffix : '');
+        }
+        return true;
+    }
+
+    function getArchivedConversationNoticeTranslation(value) {
+        const noticePattern = /^(?:View|视图|查看)\\s*(?:an\\s+archived\\s+conversation|(?:an\\s+)?个?\\s*已归档(?:的)?(?:会话|对话))\\s*(?:in|，?请前往)\\s*(?:History|历史记录)[.。]?$/i;
+        return noticePattern.test(norm(value)) ? "可在“历史记录”中查看已归档的会话" : null;
+    }
+
+    function translateArchivedConversationNotice(element) {
+        if (!element) return false;
+        let current = element.nodeType === Node.TEXT_NODE ? element.parentElement : element;
+
+        for (let depth = 0; current && depth < 7; depth++) {
+            if (current === document.body || current === document.documentElement) break;
+            if (current.nodeType !== Node.ELEMENT_NODE || isInBlockedZone(current) || !getArchivedConversationNoticeTranslation(current.textContent)) {
+                current = current.parentElement || (current.parentNode && current.parentNode.host);
+                continue;
+            }
+
+            const historyElement = Array.from(current.querySelectorAll('*')).find(candidate => {
+                return !isInBlockedZone(candidate) && /^(?:History|历史记录)[.。]?$/i.test(norm(candidate.textContent));
+            });
+            if (!historyElement) return false;
+
+            const textNodes = collectTextNodes(current);
+            const historyTextNodes = collectTextNodes(historyElement);
+            if (textNodes.length === 0 || historyTextNodes.length === 0 || textNodes.some(textNode => isInBlockedZone(textNode))) return false;
+
+            const firstHistoryIndex = textNodes.indexOf(historyTextNodes[0]);
+            const lastHistoryIndex = textNodes.indexOf(historyTextNodes[historyTextNodes.length - 1]);
+            if (firstHistoryIndex <= 0 || lastHistoryIndex < firstHistoryIndex) return false;
+
+            const prefixNodes = textNodes.slice(0, firstHistoryIndex);
+            const suffixNodes = textNodes.slice(lastHistoryIndex + 1);
+            replaceTextNode(prefixNodes[0], "可在");
+            for (let i = 1; i < prefixNodes.length; i++) replaceTextNode(prefixNodes[i], '');
+            replaceTextNode(historyTextNodes[0], "历史记录");
+            for (let i = 1; i < historyTextNodes.length; i++) replaceTextNode(historyTextNodes[i], '');
+
+            if (suffixNodes.length > 0) {
+                replaceTextNode(suffixNodes[0], "中查看已归档的会话");
+                for (let i = 1; i < suffixNodes.length; i++) replaceTextNode(suffixNodes[i], '');
+            } else {
+                historyElement.parentNode.insertBefore(document.createTextNode("中查看已归档的会话"), historyElement.nextSibling);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    function translateInputDisabledNotice(element) {
+        if (!element) return false;
+        let current = element.nodeType === Node.TEXT_NODE ? element.parentElement : element;
+
+        for (let depth = 0; current && depth < 7; depth++) {
+            if (current === document.body || current === document.documentElement) break;
+            if (current.nodeType !== Node.ELEMENT_NODE || isInBlockedZone(current)) {
+                current = current.parentElement || (current.parentNode && current.parentNode.host);
+                continue;
+            }
+
+            const rawText = norm(current.textContent);
+            if (!/(?:Input disabled because|输入已禁用[，,]因为)/i.test(rawText) ||
+                !/(?:does not exist|Create the folder in this|不存在.*在此)/i.test(rawText)) {
+                current = current.parentElement || (current.parentNode && current.parentNode.host);
+                continue;
+            }
+
+            if (rawText.includes("输入已禁用，因为") && rawText.includes("中创建该文件夹")) {
+                return true;
+            }
+
+            const projectElement = Array.from(current.querySelectorAll('*')).find(candidate => {
+                return !isInBlockedZone(candidate) && /^(?:project|项目)[.。]?$/i.test(norm(candidate.textContent));
+            });
+            if (!projectElement) {
+                current = current.parentElement || (current.parentNode && current.parentNode.host);
+                continue;
+            }
+
+            const textNodes = collectTextNodes(current);
+            const projectTextNodes = collectTextNodes(projectElement);
+            if (textNodes.length === 0 || projectTextNodes.length === 0 || textNodes.some(tn => isInBlockedZone(tn))) {
+                return false;
+            }
+
+            const firstProjectIndex = textNodes.indexOf(projectTextNodes[0]);
+            const lastProjectIndex = textNodes.indexOf(projectTextNodes[projectTextNodes.length - 1]);
+            if (firstProjectIndex <= 0 || lastProjectIndex < firstProjectIndex) {
+                return false;
+            }
+
+            const prefixIndex = textNodes.findIndex((tn, idx) => {
+                return idx < firstProjectIndex && /(?:Input disabled because|输入已禁用[，,]因为)/i.test(tn.nodeValue || '');
+            });
+            if (prefixIndex < 0) {
+                current = current.parentElement || (current.parentNode && current.parentNode.host);
+                continue;
+            }
+
+            const middleNodes = [];
+            for (let i = prefixIndex + 1; i < firstProjectIndex; i++) {
+                const val = textNodes[i].nodeValue || '';
+                if (/(?:does not exist|Create the folder in this|不存在|请在此)/i.test(val)) {
+                    middleNodes.push(textNodes[i]);
+                }
+            }
+            if (middleNodes.length === 0) {
+                current = current.parentElement || (current.parentNode && current.parentNode.host);
+                continue;
+            }
+
+            replaceTextNode(textNodes[prefixIndex], "输入已禁用，因为 ");
+
+            replaceTextNode(middleNodes[0], " 不存在。请在此");
+            for (let i = 1; i < middleNodes.length; i++) {
+                replaceTextNode(middleNodes[i], '');
+            }
+
+            replaceTextNode(projectTextNodes[0], "项目");
+            for (let i = 1; i < projectTextNodes.length; i++) {
+                replaceTextNode(projectTextNodes[i], '');
+            }
+
+            const suffixNodes = textNodes.slice(lastProjectIndex + 1);
+            if (suffixNodes.length > 0) {
+                replaceTextNode(suffixNodes[0], "中创建该文件夹");
+                for (let i = 1; i < suffixNodes.length; i++) {
+                    replaceTextNode(suffixNodes[i], '');
+                }
+            } else {
+                const suffixNode = document.createTextNode("中创建该文件夹");
+                translatedValues.set(suffixNode, "中创建该文件夹");
+                projectElement.parentNode.insertBefore(suffixNode, projectElement.nextSibling);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    function translateShowMoreStatus(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE || isInBlockedZone(element)) return false;
+        const match = norm(element.textContent).match(/^Show\\s+(\\d+)\\s+more(?:\\.\\.\\.|…)?$/i);
+        if (!match) return false;
+
+        const textNodes = collectTextNodes(element);
+        if (textNodes.length === 0) return false;
+        replaceTextNode(textNodes[0], "显示另外 " + match[1] + " 个...");
+        for (let i = 1; i < textNodes.length; i++) replaceTextNode(textNodes[i], '');
+        return true;
+    }
+
+    function getBaselineQuotaRefreshTranslation(value) {
+        const match = norm(value).match(/^Your plan(?:'s|’s) baseline quota will refresh on\\s+(.+?)[.。]$/i);
+        if (!match) return null;
+
+        let refreshTime = match[1].trim();
+        if (/^\\d+$/.test(refreshTime)) return null;
+        const strayPrefix = refreshTime.match(/^\\d+\\.\\s+(\\d{2}\\/\\d{1,2}\\/\\d{1,2}\\s+\\d{1,2}:\\d{2}:\\d{2})$/);
+        if (strayPrefix) refreshTime = strayPrefix[1];
+
+        return "您当前计划的基础配额将于 " + refreshTime + " 刷新";
+    }
+
+    function replaceTextRange(textNodes, start, end, value) {
+        let offset = 0;
+        let replaced = false;
+        for (const textNode of textNodes) {
+            const original = textNode.nodeValue || '';
+            const nodeStart = offset;
+            const nodeEnd = nodeStart + original.length;
+            offset = nodeEnd;
+
+            if (nodeEnd <= start || nodeStart >= end) continue;
+
+            const before = start > nodeStart ? original.slice(0, start - nodeStart) : '';
+            const after = end < nodeEnd ? original.slice(end - nodeStart) : '';
+            if (!replaced) {
+                replaceTextNode(textNode, before + value);
+                replaced = true;
+                if (after && textNode.parentNode) {
+                    textNode.parentNode.insertBefore(document.createTextNode(after), textNode.nextSibling);
+                }
+            } else {
+                if (after) {
+                    translatedValues.delete(textNode);
+                    textNode.nodeValue = after;
+                } else {
+                    replaceTextNode(textNode, '');
+                }
+            }
+        }
+        return replaced;
+    }
+
+    function translateBaselineQuotaNotice(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE || isInBlockedZone(element)) return false;
+        if (Array.from(element.children || []).some(child => /Your plan(?:'s|’s) baseline quota will refresh on/i.test(child.textContent || ''))) {
+            return false;
+        }
+        const textNodes = collectTextNodes(element).filter(textNode => !isInBlockedZone(textNode));
+        if (textNodes.length === 0) return false;
+
+        const text = textNodes.map(textNode => textNode.nodeValue || '').join('');
+        const match = text.match(/Your plan(?:'s|’s) baseline quota will refresh on\\s+(.+?)\\.(?=\\s*(?:To continue using this model now, enable AI Credit overages\\.|You can upgrade to a Google AI Ultra plan to receive higher rate limits\\.|View plans?\\.?|$))/i);
+        if (!match || typeof match.index !== 'number') return false;
+
+        const translated = getBaselineQuotaRefreshTranslation(match[0]);
+        if (!translated) return false;
+        return replaceTextRange(textNodes, match.index, match.index + match[0].length, translated);
+    }
+
+    function getAgentSourceDisplayName(value) {
+        const normalized = norm(value);
+        if (/^browser$/i.test(normalized)) return "浏览器";
+        if (/^(?:Root|Main)\\s+Agent$/i.test(normalized)) return "主智能体";
+        return normalized;
+    }
+
+    function getDynamicSubagentStatusTranslation(value) {
+        const normalized = norm(value);
+        let match = normalized.match(/^Found\\s+(\\d+)\\s+subagents?(?:\\s*([>›❯〉→]))?$/i);
+        if (match) return "找到 " + match[1] + " 个子智能体" + (match[2] ? " " + match[2] : "");
+
+        match = normalized.match(/^Found\\s+(?:Subagents?|子智能体)$/i);
+        if (match) return "已找到子智能体";
+
+        match = normalized.match(/^Found\\s+(?:Browsers?|浏览器)(?:\\s*([>›❯〉→]))?$/i);
+        if (match) return "已找到浏览器" + (match[1] ? " " + match[1] : "");
+
+        match = normalized.match(/^(?:Killed|已中止)\\s+(\\d+)\\s+subagents?(?:\\s*([>›❯〉→]))?$/i);
+        if (match) return "已中止 " + match[1] + " 个子智能体" + (match[2] ? " " + match[2] : "");
+
+        match = normalized.match(/^Message\\s+from\\s+(?:Root\\s+Agent|主智能体)(?:\\s*([>›❯〉→]))?$/i);
+        if (match) return "来自主智能体的消息" + (match[1] ? " " + match[1] : "");
+
+        match = normalized.match(/^Error\\s+from\\s+(.+?)\\s+\\(([^()]+)\\)(?:\\s*([>›❯〉→]))?$/i);
+        if (match) return "来自" + getAgentSourceDisplayName(match[1]) + "（" + match[2] + "）的错误" + (match[3] ? " " + match[3] : "");
+
+        match = normalized.match(/^Error\\s+from\\s+\\(([^()]+)\\)(?:\\s*([>›❯〉→]))?$/i);
+        if (match) {
+            const displayName = getAgentSourceDisplayName(match[1]);
+            const source = displayName === match[1] ? " " + match[1] + " " : displayName + "（" + match[1] + "）";
+            return "来自" + source + "的错误" + (match[2] ? " " + match[2] : "");
+        }
+
+        match = normalized.match(/^Timed\\s+(\\d+)\\s+(seconds?|minutes?|hours?)(?:\\s*([>›❯〉→]))?$/i);
+        if (match) {
+            const unit = /^second/i.test(match[2]) ? "秒" : /^minute/i.test(match[2]) ? "分钟" : "小时";
+            return "耗时 " + match[1] + " " + unit + (match[3] ? " " + match[3] : "");
+        }
+
+        match = normalized.match(/^Messaged\\s+Root\\s+Agent(?:\\s*([>›❯〉→]))?$/i);
+        if (match) return "已向主智能体发送消息" + (match[1] ? " " + match[1] : "");
+
+        match = normalized.match(/^(\\d+)\\s+tasks?\\s+running,\\s*(\\d+)\\s+active\\s+goals?$/i);
+        if (match) return match[1] + " 个任务正在运行，" + match[2] + " 个活跃目标";
+
+        match = normalized.match(/^(\\d+)\\s+subagents?\\s*\\/\\s*tasks?\\s+running$/i);
+        if (match) return match[1] + " 个子智能体/任务正在运行";
+
+        match = normalized.match(/^(\\d+)\\s+active\\s+goals?$/i);
+        if (match) return match[1] + " 个活跃目标";
+
+        match = normalized.match(/^Goals?\\s+(\\d+)$/i);
+        if (match) return "目标 " + match[1];
+
+        match = normalized.match(/^(\\d+)\\s+(?:Side\\s+Questions?|个?侧边提问)(?:\\s*([>›❯〉→]))?$/i);
+        if (match) return match[1] + " 个侧边提问" + (match[2] ? " " + match[2] : "");
+
+        match = normalized.match(/^(\\d+)\\s+questions?$/i);
+        if (match) return match[1] + " 个问题";
+
+        match = normalized.match(/^View\\s+(\\d+)\\s+side\\s+questions?(?:\\s*([>›❯〉→]))?$/i);
+        if (match) return "查看 " + match[1] + " 个侧边提问" + (match[2] ? " " + match[2] : "");
+
+        match = normalized.match(/^Question\\s+(\\d+)\\s+of\\s+(\\d+)$/i);
+        if (match) return "第 " + match[1] + " 个问题，共 " + match[2] + " 个";
+
+        match = normalized.match(/^Side\\s+question\\s+failed:\\s*(.+)$/i);
+        if (match) return "侧边提问失败：" + match[1];
+
+        match = normalized.match(/^Side\\s+question\\s+answered\\.?$/i);
+        if (match) return "侧边提问已回答";
+
+        match = normalized.match(/^Asked\\s+(\\d+)\\s+questions?$/i);
+        if (match) return "已询问 " + match[1] + " 个问题";
+
+        match = normalized.match(/^(\\d+)\\s+subagents?\\s+(running|blocked|completed|failed)$/i);
+        if (match) {
+            const stateMap = {
+                running: "正在运行",
+                blocked: "已阻塞",
+                completed: "已完成",
+                failed: "已失败"
+            };
+            return match[1] + " 个子智能体" + stateMap[match[2].toLowerCase()];
+        }
+        return null;
+    }
+
+    function getBracketedTaskStatusTranslation(value) {
+        const normalized = norm(value);
+        const match = normalized.match(/^\\[(Completed|Blocked|Running|Failed|Stopped|In Progress|Cancelled|Canceled)\\](?:\\s+(.+))?$/i);
+        if (!match) return null;
+
+        const sourceStatus = match[1];
+        const translatedStatus = map.get(sourceStatus)
+            || lowerMap.get(sourceStatus.toLowerCase());
+        if (!translatedStatus) return null;
+        return "[" + translatedStatus + "]" + (match[2] ? " " + match[2] : "");
+    }
+
+    function getDynamicProductUiTranslation(value) {
+        const normalized = norm(value);
+        let match = normalized.match(/^When toggled on,\\s+(.+?)\\s+collects usage data to help Google enhance performance and features\\.$/i);
+        if (match) return "启用后，" + match[1] + " 会收集使用数据，以帮助 Google 改进性能和功能";
+
+        match = normalized.match(/^Receive product updates, tips, and promotions from Google\\s+(.+?)\\s+via email\\.$/i);
+        if (match) return "通过电子邮件接收 Google " + match[1] + " 的产品更新、使用技巧和推广信息";
+
+        match = normalized.match(/^When toggled on,\\s+(.+?)\\s+will use your AI credits to fulfill model requests once you're out of model quota\\.\\s+\\1\\s+will always use your model quota first before using AI credits\\.$/i);
+        if (match) return "启用后，当模型配额用尽时，" + match[1] + " 将使用您的 AI 额度处理模型请求。系统会优先使用模型配额，之后才使用 AI 额度";
+
+        match = normalized.match(/^Build with\\s+(.+?)\\s+Plugins$/i);
+        if (match) return "使用 " + match[1] + " 插件构建";
+
+        match = normalized.match(/^Plugins are packaged collections of skills and MCPs to help the Agent in\\s+(.+?)\\s+work with Google developer products\\. You can always change your choices in Settings\\.$/i);
+        if (match) return "插件是打包的技能与 MCP 集合，用于帮助 " + match[1] + " 中的智能体使用 Google 开发者产品。您随时可以在设置中更改选择";
+
+        match = normalized.match(/^Manage\\s+(project|workspace)\\s+folders, agent settings, and permissions\\.$/i);
+        if (match) {
+            const scope = match[1].toLowerCase() === "project" ? "项目" : "工作区";
+            return "管理" + scope + "文件夹、智能体设置和权限";
+        }
+
+        match = normalized.match(/^Agent settings and permissions for conversations outside of\\s+(projects|workspaces)\\.$/i);
+        if (match) {
+            const scope = match[1].toLowerCase() === "projects" ? "项目" : "工作区";
+            return "用于不属于任何" + scope + "的会话的智能体设置和权限";
+        }
+
+        match = normalized.match(/^File exceeds the (\\d+(?:\\.\\d+)?\\s*(?:[KMGTP]?B|bytes?))\\s+display limit(?:\\s*\\(([^)]+)\\))?\\.?$/i);
+        if (match) {
+            return "文件超过 " + match[1] + " 显示限制" + (match[2] ? " (" + match[2] + ")" : "");
+        }
+
+        match = normalized.match(/^Setting up WSL:\\s*(.+)$/i);
+        if (match) return "正在设置 WSL：" + match[1];
+
+        match = normalized.match(/^Deleted\\s+["“](.+?)["”][.。]?$/i);
+        if (match) return "已删除“" + match[1] + "”";
+
+        // Permission options (both pure English and half-translated recovery)
+        match = normalized.match(/^(?:(?:\\[\\d+\\]|\\d+[.):]?)\\s+)?(?:Yes, and always allow|是，且始终允许)(?: '(.+)')?\\s+in this project$/i);
+        if (match) return match[1] ? "是，且在此项目中始终允许运行 '" + match[1] + "'" : "是，且在此项目中始终允许";
+
+        match = normalized.match(/^(?:(?:\\[\\d+\\]|\\d+[.):]?)\\s+)?(?:Yes, and always allow|是，且始终允许)(?: '(.+)')?\\s+when not in a project$/i);
+        if (match) return match[1] ? "是，且在不属于任何项目时始终允许运行 '" + match[1] + "'" : "是，且在不属于任何项目时始终允许";
+
+        match = normalized.match(/^(?:(?:\\[\\d+\\]|\\d+[.):]?)\\s+)?(?:Yes, and always allow|是，且始终允许)(?: '(.+)')?\\s+in this workspace$/i);
+        if (match) return match[1] ? "是，且在此工作区中始终允许运行 '" + match[1] + "'" : "是，且在此工作区中始终允许";
+
+        match = normalized.match(/^(?:(?:\\[\\d+\\]|\\d+[.):]?)\\s+)?(?:Yes, and always allow|是，且始终允许)(?: '(.+)')?\\s+in this conversation$/i);
+        if (match) return match[1] ? "是，且在此会话中始终允许运行 '" + match[1] + "'" : "是，且在此会话中始终允许";
+
+        match = normalized.match(/^(?:(?:\\[\\d+\\]|\\d+[.):]?)\\s+)?(?:Yes, and always allow|是，且始终允许)\\s*'(.+)'$/i);
+        if (match) return "是，且始终允许运行 '" + match[1] + "'";
+
+        match = normalized.match(/^(?:(?:\\[\\d+\\]|\\d+[.):]?)\\s+)?(?:Yes, save rule|是，保存规则)(?:\\s*(?:for|用于)\\s*'(.+)')?\\s+in this project$/i);
+        if (match) return match[1] ? "是，在此项目中为 '" + match[1] + "' 保存规则" : "是，在此项目中保存规则";
+
+        match = normalized.match(/^(?:(?:\\[\\d+\\]|\\d+[.):]?)\\s+)?(?:Yes, save rule|是，保存规则)(?:\\s*(?:for|用于)\\s*'(.+)')?\\s+when not in a project$/i);
+        if (match) return match[1] ? "是，在不属于任何项目时为 '" + match[1] + "' 保存规则" : "是，在不属于任何项目时保存规则";
+
+        match = normalized.match(/^(?:(?:\\[\\d+\\]|\\d+[.):]?)\\s+)?(?:Yes, save rule|是，保存规则)(?:\\s*(?:for|用于)\\s*'(.+)')?\\s+in this workspace$/i);
+        if (match) return match[1] ? "是，在此工作区中为 '" + match[1] + "' 保存规则" : "是，在此工作区中保存规则";
+
+        match = normalized.match(/^(?:(?:\\[\\d+\\]|\\d+[.):]?)\\s+)?(?:Yes, save rule|是，保存规则)(?:\\s*(?:for|用于)\\s*'(.+)')?\\s+in this conversation$/i);
+        if (match) return match[1] ? "是，在此会话中为 '" + match[1] + "' 保存规则" : "是，在此会话中保存规则";
+
+        match = normalized.match(/^(?:(?:\\[\\d+\\]|\\d+[.):]?)\\s+)?(?:Yes, save rule|是，保存规则)(?:\\s*(?:for|用于)\\s*'(.+)')?\\s+globally$/i);
+        if (match) return match[1] ? "是，全局为 '" + match[1] + "' 保存规则" : "是，全局保存规则";
+
+        match = normalized.match(/^(?:(?:\\[\\d+\\]|\\d+[.):]?)\\s+)?(?:Yes, save rule|是，保存规则)\\s*(?:for|用于)\\s*'(.+)'$/i);
+        if (match) return "是，为 '" + match[1] + "' 保存规则";
+
+        // Permission questions
+        match = normalized.match(/^(?:Save rule to always allow|保存为始终允许规则)\\s+(.+?)\\??$/i);
+        if (match) {
+            let act = match[1].toLowerCase();
+            let actTrans = null;
+            if (act === 'read access to this path') actTrans = '读取此路径';
+            else if (act === 'write access to this path') actTrans = '写入此路径';
+            else if (act === 'reading this url') actTrans = '读取此 URL';
+            else if (act === 'executing actions on this url') actTrans = '在此 URL 上执行操作';
+            else if (act === 'running this command') actTrans = '运行此命令';
+            else if (act === 'running this command outside the sandbox') actTrans = '在沙箱外运行此命令';
+            else if (act === 'using this mcp tool') actTrans = '使用此 MCP 工具';
+            else if (act === 'a one-time administrator (uac) elevation') actTrans = '单次管理员 (UAC) 提权';
+            else if (act === 'access to this resource') actTrans = '访问此资源';
+            if (actTrans) {
+                const separator = /[A-Za-z0-9]$/.test(actTrans) ? " 的规则？" : "的规则？";
+                return "保存为始终允许" + actTrans + separator;
+            }
+        }
+
+        match = normalized.match(/^Allow\\s+(.+?)\\??$/i);
+        if (match) {
+            let act = match[1].toLowerCase();
+            let actTrans = null;
+            if (act === 'read access to this path') actTrans = '读取此路径';
+            else if (act === 'write access to this path') actTrans = '写入此路径';
+            else if (act === 'reading this url') actTrans = '读取此 URL';
+            else if (act === 'executing actions on this url') actTrans = '在此 URL 上执行操作';
+            else if (act === 'running this command') actTrans = '运行此命令';
+            else if (act === 'running this command outside the sandbox') actTrans = '在沙箱外运行此命令';
+            else if (act === 'using this mcp tool') actTrans = '使用此 MCP 工具';
+            else if (act === 'a one-time administrator (uac) elevation') actTrans = '单次管理员 (UAC) 提权';
+            else if (act === 'access to this resource') actTrans = '访问此资源';
+            if (actTrans) return "是否允许" + actTrans + "？";
+        }
+
+        return null;
+    }
+
+    function getProjectConversationCountTranslation(value) {
+        const normalized = norm(value);
+        let match = normalized.match(/^(\\d+)\\s+(?:active conversations?|个活跃会话)(?:\\s*(?:and|及)\\s*(\\d+)\\s+(?:archived conversations?|个已归档会话))?$/i);
+        if (match) {
+            let result = match[1] + " 个活跃会话";
+            if (match[2]) result += "及 " + match[2] + " 个已归档会话";
+            return result;
+        }
+
+        match = normalized.match(/^(\\d+)\\s+(?:archived conversations?|个已归档会话)$/i);
+        return match ? match[1] + " 个已归档会话" : null;
+    }
+
+    function getProjectDeleteSummaryTranslation(value) {
+        const normalized = norm(value);
+        const match = normalized.match(/^(?:Permanently delete|永久删除)\\s+(.{1,200}?)\\s*(?:including|，?包含)\\s+((?:\\d+\\s+(?:active conversations?|个活跃会话)(?:\\s*(?:and|及)\\s*\\d+\\s+(?:archived conversations?|个已归档会话))?)|(?:\\d+\\s+(?:archived conversations?|个已归档会话)))[.。]?$/i);
+        if (!match) return null;
+
+        const countTranslation = getProjectConversationCountTranslation(match[2]);
+        return countTranslation ? "永久删除 " + match[1] + "，包含 " + countTranslation : null;
+    }
+
+    function translateProjectDeleteSummary(element) {
+        if (!element) return false;
+
+        let current = element.nodeType === Node.TEXT_NODE ? element.parentElement : element;
+        for (let depth = 0; current && depth < 6; depth++) {
+            if (current === document.body || current === document.documentElement) break;
+            if (current.nodeType === Node.ELEMENT_NODE &&
+                current.tagName?.toUpperCase() === 'SPAN' &&
+                !isInBlockedZone(current)) {
+                const textNodes = collectTextNodes(current).filter(textNode => !isInBlockedZone(textNode));
+                const wholeTranslation = getProjectDeleteSummaryTranslation(
+                    textNodes.map(textNode => textNode.nodeValue || '').join('')
+                );
+                if (wholeTranslation) {
+                    const prefixIndex = textNodes.findIndex(textNode => /^(?:Permanently delete|永久删除)$/i.test(norm(textNode.nodeValue)));
+                    const includingIndex = textNodes.findIndex((textNode, index) => {
+                        return index > prefixIndex && /^(?:including|，?包含)$/i.test(norm(textNode.nodeValue));
+                    });
+                    const countIndex = textNodes.findIndex((textNode, index) => {
+                        return index > includingIndex && !!getProjectConversationCountTranslation(textNode.nodeValue);
+                    });
+                    if (prefixIndex < 0 || includingIndex < 0 || countIndex < 0) return false;
+
+                    const hasProjectName = textNodes.slice(prefixIndex + 1, includingIndex)
+                        .some(textNode => norm(textNode.nodeValue));
+                    if (!hasProjectName) return false;
+
+                    replaceTextNode(textNodes[prefixIndex], "永久删除");
+                    replaceTextNode(textNodes[includingIndex], "，包含 ");
+                    replaceTextNode(textNodes[countIndex], getProjectConversationCountTranslation(textNodes[countIndex].nodeValue));
+
+                    const punctuationNode = textNodes.slice(countIndex + 1)
+                        .find(textNode => /^[.。]$/.test(norm(textNode.nodeValue)));
+                    if (punctuationNode) replaceTextNode(punctuationNode, "");
+                    return true;
+                }
+            }
+            current = current.parentElement || (current.parentNode && current.parentNode.host);
+        }
+        return false;
+    }
+
+    function translatePermanentlyDeleteNotice(element) {
+        if (!element) return false;
+
+        let current = element.nodeType === Node.TEXT_NODE ? element.parentElement : element;
+        for (let depth = 0; current && depth < 6; depth++) {
+            if (current === document.body || current === document.documentElement) break;
+            if (current.nodeType === Node.ELEMENT_NODE && !isInBlockedZone(current)) {
+                const textNodes = collectTextNodes(current).filter(textNode => !isInBlockedZone(textNode));
+                if (textNodes.length > 0) {
+                    const rawText = textNodes.map(tn => tn.nodeValue || '').join('');
+                    const normalized = norm(rawText);
+
+                    const activeAndArchivedMatch = normalized.match(/^(?:This will permanently delete|这将永久删除)\\s+(\\d+)\\s+(?:active (?:conversations?|chats?)|个活跃会话)\\s*(?:and|及)\\s*(\\d+)\\s+(?:archived (?:conversations?|chats?)|个已归档会话)\\s*(?:within it[.。]?)?$/i);
+                    const activeOnlyMatch = normalized.match(/^(?:This will permanently delete|这将永久删除)\\s+(\\d+)\\s+(?:active (?:conversations?|chats?)|个活跃会话)\\s*(?:within it[.。]?)?$/i);
+                    const archivedOnlyMatch = normalized.match(/^(?:This will permanently delete|这将永久删除)\\s+(\\d+)\\s+(?:archived (?:conversations?|chats?)|个已归档会话)\\s*(?:within it[.。]?)?$/i);
+
+                    if (activeAndArchivedMatch) {
+                        const activeCount = activeAndArchivedMatch[1];
+                        const archivedCount = activeAndArchivedMatch[2];
+                        if (textNodes.length === 1) {
+                            return replaceTextNode(textNodes[0], "这将永久删除 " + activeCount + " 个活跃会话及 " + archivedCount + " 个已归档会话");
+                        }
+                        const firstCountIndex = textNodes.findIndex(tn => {
+                            const val = norm(tn.nodeValue);
+                            return val === activeCount || val.startsWith(activeCount + " ");
+                        });
+                        const secondCountIndex = firstCountIndex >= 0
+                            ? textNodes.findIndex((tn, idx) => {
+                                if (idx <= firstCountIndex) return false;
+                                const val = norm(tn.nodeValue);
+                                return val === archivedCount || val.startsWith(archivedCount + " ");
+                            })
+                            : -1;
+                        if (firstCountIndex >= 0 && secondCountIndex > firstCountIndex) {
+                            let changed = replaceTextNode(textNodes[0], "这将永久删除 ");
+                            for (let i = 1; i < firstCountIndex; i++) {
+                                changed = replaceTextNode(textNodes[i], "") || changed;
+                            }
+                            const firstIsIsolated = norm(textNodes[firstCountIndex].nodeValue) === activeCount;
+                            if (firstIsIsolated) {
+                                changed = replaceTextNode(textNodes[firstCountIndex + 1], " 个活跃会话及 ") || changed;
+                                for (let i = firstCountIndex + 2; i < secondCountIndex; i++) {
+                                    changed = replaceTextNode(textNodes[i], "") || changed;
+                                }
+                            } else {
+                                changed = replaceTextNode(textNodes[firstCountIndex], activeCount + " 个活跃会话及 ") || changed;
+                                for (let i = firstCountIndex + 1; i < secondCountIndex; i++) {
+                                    changed = replaceTextNode(textNodes[i], "") || changed;
+                                }
+                            }
+                            const secondIsIsolated = norm(textNodes[secondCountIndex].nodeValue) === archivedCount;
+                            if (secondIsIsolated) {
+                                if (secondCountIndex + 1 < textNodes.length) {
+                                    changed = replaceTextNode(textNodes[secondCountIndex + 1], " 个已归档会话") || changed;
+                                    for (let i = secondCountIndex + 2; i < textNodes.length; i++) {
+                                        changed = replaceTextNode(textNodes[i], "") || changed;
+                                    }
+                                }
+                            } else {
+                                changed = replaceTextNode(textNodes[secondCountIndex], archivedCount + " 个已归档会话") || changed;
+                                for (let i = secondCountIndex + 1; i < textNodes.length; i++) {
+                                    changed = replaceTextNode(textNodes[i], "") || changed;
+                                }
+                            }
+                            return changed;
+                        }
+                    } else if (activeOnlyMatch) {
+                        const activeCount = activeOnlyMatch[1];
+                        if (textNodes.length === 1) {
+                            return replaceTextNode(textNodes[0], "这将永久删除 " + activeCount + " 个活跃会话");
+                        }
+                        const countIndex = textNodes.findIndex(tn => {
+                            const val = norm(tn.nodeValue);
+                            return val === activeCount || val.startsWith(activeCount + " ");
+                        });
+                        if (countIndex >= 0) {
+                            let changed = replaceTextNode(textNodes[0], "这将永久删除 ");
+                            for (let i = 1; i < countIndex; i++) {
+                                changed = replaceTextNode(textNodes[i], "") || changed;
+                            }
+                            const isIsolated = norm(textNodes[countIndex].nodeValue) === activeCount;
+                            if (isIsolated) {
+                                if (countIndex + 1 < textNodes.length) {
+                                    changed = replaceTextNode(textNodes[countIndex + 1], " 个活跃会话") || changed;
+                                    for (let i = countIndex + 2; i < textNodes.length; i++) {
+                                        changed = replaceTextNode(textNodes[i], "") || changed;
+                                    }
+                                }
+                            } else {
+                                changed = replaceTextNode(textNodes[countIndex], activeCount + " 个活跃会话") || changed;
+                                for (let i = countIndex + 1; i < textNodes.length; i++) {
+                                    changed = replaceTextNode(textNodes[i], "") || changed;
+                                }
+                            }
+                            return changed;
+                        }
+                    } else if (archivedOnlyMatch) {
+                        const archivedCount = archivedOnlyMatch[1];
+                        if (textNodes.length === 1) {
+                            return replaceTextNode(textNodes[0], "这将永久删除 " + archivedCount + " 个已归档会话");
+                        }
+                        const countIndex = textNodes.findIndex(tn => {
+                            const val = norm(tn.nodeValue);
+                            return val === archivedCount || val.startsWith(archivedCount + " ");
+                        });
+                        if (countIndex >= 0) {
+                            let changed = replaceTextNode(textNodes[0], "这将永久删除 ");
+                            for (let i = 1; i < countIndex; i++) {
+                                changed = replaceTextNode(textNodes[i], "") || changed;
+                            }
+                            const isIsolated = norm(textNodes[countIndex].nodeValue) === archivedCount;
+                            if (isIsolated) {
+                                if (countIndex + 1 < textNodes.length) {
+                                    changed = replaceTextNode(textNodes[countIndex + 1], " 个已归档会话") || changed;
+                                    for (let i = countIndex + 2; i < textNodes.length; i++) {
+                                        changed = replaceTextNode(textNodes[i], "") || changed;
+                                    }
+                                }
+                            } else {
+                                changed = replaceTextNode(textNodes[countIndex], archivedCount + " 个已归档会话") || changed;
+                                for (let i = countIndex + 1; i < textNodes.length; i++) {
+                                    changed = replaceTextNode(textNodes[i], "") || changed;
+                                }
+                            }
+                            return changed;
+                        }
+                    }
+                }
+            }
+            current = current.parentElement || (current.parentNode && current.parentNode.host);
+        }
+        return false;
+    }
+
+    function translateArchiveNotice(element) {
+        if (!element) return false;
+
+        let current = element.nodeType === Node.TEXT_NODE ? element.parentElement : element;
+        for (let depth = 0; current && depth < 6; depth++) {
+            if (current === document.body || current === document.documentElement) break;
+            if (current.nodeType === Node.ELEMENT_NODE && !isInBlockedZone(current)) {
+                const textNodes = collectTextNodes(current).filter(textNode => !isInBlockedZone(textNode));
+                if (textNodes.length > 0) {
+                    const rawText = textNodes.map(tn => tn.nodeValue || '').join('');
+                    const normalized = norm(rawText);
+
+                    const activeAndArchivedMatch = normalized.match(/^(?:This will archive|这将归档)\\s+(\\d+)\\s*(?:active (?:conversations?|chats?)|个活跃会话)\\s*(?:and|及)\\s*(\\d+)\\s*(?:archived (?:conversations?|chats?)|个已归档会话)\\s*(?:within it[.。]?)?$/i);
+                    const activeOnlyMatch = normalized.match(/^(?:This will archive|这将归档)\\s+(\\d+)\\s*(?:active (?:conversations?|chats?)|个活跃会话)\\s*(?:within it[.。]?)?$/i);
+                    const archivedOnlyMatch = normalized.match(/^(?:This will archive|这将归档)\\s+(\\d+)\\s*(?:archived (?:conversations?|chats?)|个已归档会话)\\s*(?:within it[.。]?)?$/i);
+                    const countOnlyMatch = normalized.match(/^(?:This will archive|这将归档)\\s+(\\d+)\\s*(?:conversations?|chats?|会话s?|个会话)\\s*(?:within it[.。]?)?$/i);
+
+                    if (activeAndArchivedMatch) {
+                        const activeCount = activeAndArchivedMatch[1];
+                        const archivedCount = activeAndArchivedMatch[2];
+                        if (textNodes.length === 1) {
+                            return replaceTextNode(textNodes[0], "这将归档其中的 " + activeCount + " 个活跃会话及 " + archivedCount + " 个已归档会话");
+                        }
+                        const firstCountIndex = textNodes.findIndex(tn => {
+                            const val = norm(tn.nodeValue);
+                            return val === activeCount || val.startsWith(activeCount + " ");
+                        });
+                        const secondCountIndex = firstCountIndex >= 0
+                            ? textNodes.findIndex((tn, idx) => {
+                                if (idx <= firstCountIndex) return false;
+                                const val = norm(tn.nodeValue);
+                                return val === archivedCount || val.startsWith(archivedCount + " ");
+                            })
+                            : -1;
+                        if (firstCountIndex >= 0 && secondCountIndex > firstCountIndex) {
+                            let changed = replaceTextNode(textNodes[0], "这将归档其中的 ");
+                            for (let i = 1; i < firstCountIndex; i++) {
+                                changed = replaceTextNode(textNodes[i], "") || changed;
+                            }
+                            const firstIsIsolated = norm(textNodes[firstCountIndex].nodeValue) === activeCount;
+                            if (firstIsIsolated) {
+                                changed = replaceTextNode(textNodes[firstCountIndex + 1], " 个活跃会话及 ") || changed;
+                                for (let i = firstCountIndex + 2; i < secondCountIndex; i++) {
+                                    changed = replaceTextNode(textNodes[i], "") || changed;
+                                }
+                            } else {
+                                changed = replaceTextNode(textNodes[firstCountIndex], activeCount + " 个活跃会话及 ") || changed;
+                                for (let i = firstCountIndex + 1; i < secondCountIndex; i++) {
+                                    changed = replaceTextNode(textNodes[i], "") || changed;
+                                }
+                            }
+                            const secondIsIsolated = norm(textNodes[secondCountIndex].nodeValue) === archivedCount;
+                            if (secondIsIsolated) {
+                                if (secondCountIndex + 1 < textNodes.length) {
+                                    changed = replaceTextNode(textNodes[secondCountIndex + 1], " 个已归档会话") || changed;
+                                    for (let i = secondCountIndex + 2; i < textNodes.length; i++) {
+                                        changed = replaceTextNode(textNodes[i], "") || changed;
+                                    }
+                                }
+                            } else {
+                                changed = replaceTextNode(textNodes[secondCountIndex], archivedCount + " 个已归档会话") || changed;
+                                for (let i = secondCountIndex + 1; i < textNodes.length; i++) {
+                                    changed = replaceTextNode(textNodes[i], "") || changed;
+                                }
+                            }
+                            return changed;
+                        }
+                    } else if (activeOnlyMatch) {
+                        const activeCount = activeOnlyMatch[1];
+                        if (textNodes.length === 1) {
+                            return replaceTextNode(textNodes[0], "这将归档其中的 " + activeCount + " 个活跃会话");
+                        }
+                        const countIndex = textNodes.findIndex(tn => {
+                            const val = norm(tn.nodeValue);
+                            return val === activeCount || val.startsWith(activeCount + " ");
+                        });
+                        if (countIndex >= 0) {
+                            let changed = replaceTextNode(textNodes[0], "这将归档其中的 ");
+                            for (let i = 1; i < countIndex; i++) {
+                                changed = replaceTextNode(textNodes[i], "") || changed;
+                            }
+                            const isIsolated = norm(textNodes[countIndex].nodeValue) === activeCount;
+                            if (isIsolated) {
+                                if (countIndex + 1 < textNodes.length) {
+                                    changed = replaceTextNode(textNodes[countIndex + 1], " 个活跃会话") || changed;
+                                    for (let i = countIndex + 2; i < textNodes.length; i++) {
+                                        changed = replaceTextNode(textNodes[i], "") || changed;
+                                    }
+                                }
+                            } else {
+                                changed = replaceTextNode(textNodes[countIndex], activeCount + " 个活跃会话") || changed;
+                                for (let i = countIndex + 1; i < textNodes.length; i++) {
+                                    changed = replaceTextNode(textNodes[i], "") || changed;
+                                }
+                            }
+                            return changed;
+                        }
+                    } else if (archivedOnlyMatch) {
+                        const archivedCount = archivedOnlyMatch[1];
+                        if (textNodes.length === 1) {
+                            return replaceTextNode(textNodes[0], "这将归档其中的 " + archivedCount + " 个已归档会话");
+                        }
+                        const countIndex = textNodes.findIndex(tn => {
+                            const val = norm(tn.nodeValue);
+                            return val === archivedCount || val.startsWith(archivedCount + " ");
+                        });
+                        if (countIndex >= 0) {
+                            let changed = replaceTextNode(textNodes[0], "这将归档其中的 ");
+                            for (let i = 1; i < countIndex; i++) {
+                                changed = replaceTextNode(textNodes[i], "") || changed;
+                            }
+                            const isIsolated = norm(textNodes[countIndex].nodeValue) === archivedCount;
+                            if (isIsolated) {
+                                if (countIndex + 1 < textNodes.length) {
+                                    changed = replaceTextNode(textNodes[countIndex + 1], " 个已归档会话") || changed;
+                                    for (let i = countIndex + 2; i < textNodes.length; i++) {
+                                        changed = replaceTextNode(textNodes[i], "") || changed;
+                                    }
+                                }
+                            } else {
+                                changed = replaceTextNode(textNodes[countIndex], archivedCount + " 个已归档会话") || changed;
+                                for (let i = countIndex + 1; i < textNodes.length; i++) {
+                                    changed = replaceTextNode(textNodes[i], "") || changed;
+                                }
+                            }
+                            return changed;
+                        }
+                    } else if (countOnlyMatch) {
+                        const count = countOnlyMatch[1];
+                        if (textNodes.length === 1) {
+                            return replaceTextNode(textNodes[0], "这将归档其中的 " + count + " 个会话");
+                        }
+                        const countIndex = textNodes.findIndex(tn => {
+                            const val = norm(tn.nodeValue);
+                            return val === count || val.startsWith(count + " ") || val.startsWith(count + "会话");
+                        });
+                        if (countIndex >= 0) {
+                            let changed = replaceTextNode(textNodes[0], "这将归档其中的 ");
+                            for (let i = 1; i < countIndex; i++) {
+                                changed = replaceTextNode(textNodes[i], "") || changed;
+                            }
+                            const countNodeVal = norm(textNodes[countIndex].nodeValue);
+                            const isIsolated = countNodeVal === count;
+                            if (isIsolated) {
+                                if (countIndex + 1 < textNodes.length) {
+                                    changed = replaceTextNode(textNodes[countIndex + 1], " 个会话") || changed;
+                                    for (let i = countIndex + 2; i < textNodes.length; i++) {
+                                        changed = replaceTextNode(textNodes[i], "") || changed;
+                                    }
+                                }
+                            } else {
+                                changed = replaceTextNode(textNodes[countIndex], count + " 个会话") || changed;
+                                for (let i = countIndex + 1; i < textNodes.length; i++) {
+                                    changed = replaceTextNode(textNodes[i], "") || changed;
+                                }
+                            }
+                            return changed;
+                        }
+                    }
+                }
+            }
+            current = current.parentElement || (current.parentNode && current.parentNode.host);
+        }
+        return false;
+    }
+
+    function translateBrowserSubagentNotice(element) {
+        if (!element) return false;
+
+        let current = element.nodeType === Node.TEXT_NODE ? element.parentElement : element;
+        for (let depth = 0; current && depth < 6; depth++) {
+            if (current === document.body || current === document.documentElement) break;
+            if (current.nodeType === Node.ELEMENT_NODE && !isInBlockedZone(current)) {
+                const cText = current.textContent || '';
+                if (cText.length <= 500 &&
+                    /(?:Configure the browser subagent|配置浏览器子智能体)/i.test(cText) &&
+                    /(?:Google Chrome|to be installed)/i.test(cText)) {
+                    const textNodes = collectTextNodes(current).filter(tn => !isInBlockedZone(tn));
+                    if (textNodes.length === 0) return false;
+
+                    let changed = false;
+                    for (let i = 0; i < textNodes.length; i++) {
+                        const tn = textNodes[i];
+                        const val = tn.nodeValue || '';
+                        const valN = norm(val);
+
+                        if (/^Configure the browser subagent\\.\\s*It requires$/i.test(valN)) {
+                            changed = replaceTextNode(tn, "配置浏览器子智能体。它需要安装 ") || changed;
+                        } else if (/^to be installed\\.?$/i.test(valN)) {
+                            changed = replaceTextNode(tn, "。") || changed;
+                        } else if (/^to be installed\\.\\s*(.+)$/i.test(valN)) {
+                            const match = valN.match(/^to be installed\\.\\s*(.+)$/i);
+                            const rest = match[1];
+                            const restTrans = map.get(norm(rest)) || lowerMap.get(norm(rest).toLowerCase()) || rest;
+                            changed = replaceTextNode(tn, "。" + restTrans) || changed;
+                        } else if (/^The browser subagent can be invoked by typing \\/browser in the conversation input box\\.?$/i.test(valN)) {
+                            changed = replaceTextNode(tn, "您可以通过在会话输入框中输入 /browser 来调用浏览器子智能体") || changed;
+                        }
+                    }
+                    if (changed) return true;
+                }
+            }
+            current = current.parentElement || (current.parentNode && current.parentNode.host);
+        }
+        return false;
+    }
+
+    function translateLegalHelpNotice(element) {
+        if (!element) return false;
+
+        let current = element.nodeType === Node.TEXT_NODE ? element.parentElement : element;
+        for (let depth = 0; current && depth < 6; depth++) {
+            if (current === document.body || current === document.documentElement) break;
+            if (current.nodeType === Node.ELEMENT_NODE && !isInBlockedZone(current)) {
+                const cText = current.textContent || '';
+                if (cText.length <= 300 &&
+                    /(?:Visit|访问)\\s*(?:Legal Help|法律帮助)/i.test(cText) &&
+                    /(?:to ask for content changes for legal reasons|出于法律原因)/i.test(cText)) {
+                    const textNodes = collectTextNodes(current).filter(tn => !isInBlockedZone(tn));
+                    if (textNodes.length === 0) return false;
+
+                    let changed = false;
+                    for (let i = 0; i < textNodes.length; i++) {
+                        const tn = textNodes[i];
+                        const val = tn.nodeValue || '';
+                        const valN = norm(val);
+
+                        if (/^Visit$/i.test(valN)) {
+                            changed = replaceTextNode(tn, "若出于法律原因需要申请更改内容，请访问 ") || changed;
+                        } else if (/^Legal Help$/i.test(valN)) {
+                            changed = replaceTextNode(tn, "法律帮助") || changed;
+                        } else if (/^to ask for content changes for legal reasons[.。]?$/i.test(valN)) {
+                            changed = replaceTextNode(tn, " 页面") || changed;
+                        } else if (/^Visit Legal Help to ask for content changes for legal reasons[.。]?$/i.test(valN)) {
+                            changed = replaceTextNode(tn, "若出于法律原因需要申请更改内容，请访问法律帮助页面") || changed;
+                        }
+                    }
+                    if (changed) return true;
+                }
+            }
+            current = current.parentElement || (current.parentNode && current.parentNode.host);
+        }
+        return false;
+    }
+
+    function translatePlanCommandAlert(element) {
+        if (!element) return false;
+
+        let alertContainer = null;
+        let current = element.nodeType === Node.TEXT_NODE ? element.parentElement : element;
+        for (let depth = 0; current && depth < 6; depth++) {
+            if (current === document.body || current === document.documentElement) break;
+            if (current.nodeType === Node.ELEMENT_NODE && !isInBlockedZone(current)) {
+                if (current.getAttribute?.('data-testid') === 'plan-command-fyi-alert') {
+                    alertContainer = current;
+                    break;
+                }
+                if (current.querySelector?.('[data-testid="plan-command-fyi-alert"]')) {
+                    alertContainer = current.querySelector('[data-testid="plan-command-fyi-alert"]');
+                    break;
+                }
+                const cText = current.textContent || '';
+                if (cText.length <= 250 &&
+                    /(?:Type|类型|键入)\\s*\\/\\s*(?:and\\s+select|并选择)\\s*plan/i.test(cText) &&
+                    /(?:to have the agent generate a plan|让智能体生成计划)/i.test(cText)) {
+                    alertContainer = current;
+                    break;
+                }
+            }
+            current = current.parentElement || (current.parentNode && current.parentNode.host);
+        }
+
+        if (!alertContainer) return false;
+
+        const span = alertContainer.querySelector('span') || alertContainer;
+        const allTextNodes = collectTextNodes(span);
+        if (allTextNodes.length === 0) return false;
+
+        let idxSlash = -1;
+        let idxPlan = -1;
+        for (let i = 0; i < allTextNodes.length; i++) {
+            const tn = allTextNodes[i];
+            const parentTag = tn.parentElement?.tagName?.toUpperCase();
+            const val = (tn.nodeValue || '').trim();
+            if (parentTag === 'CODE' && val === '/' && idxSlash === -1) {
+                idxSlash = i;
+            } else if (parentTag === 'CODE' && /^plan$/i.test(val) && idxSlash !== -1 && idxPlan === -1) {
+                idxPlan = i;
+            }
+        }
+
+        if (idxSlash === -1 || idxPlan === -1 || idxSlash >= idxPlan) return false;
+
+        let changed = false;
+
+        const beforeNodes = allTextNodes.slice(0, idxSlash);
+        if (beforeNodes.length > 0) {
+            if (beforeNodes[0].nodeValue !== '键入 ') {
+                changed = replaceTextNode(beforeNodes[0], '键入 ') || changed;
+            }
+            for (let i = 1; i < beforeNodes.length; i++) {
+                if (beforeNodes[i].nodeValue !== '') {
+                    changed = replaceTextNode(beforeNodes[i], '') || changed;
+                }
+            }
+        }
+
+        const middleNodes = allTextNodes.slice(idxSlash + 1, idxPlan);
+        if (middleNodes.length > 0) {
+            if (middleNodes[0].nodeValue !== ' 并选择 ') {
+                changed = replaceTextNode(middleNodes[0], ' 并选择 ') || changed;
+            }
+            for (let i = 1; i < middleNodes.length; i++) {
+                if (middleNodes[i].nodeValue !== '') {
+                    changed = replaceTextNode(middleNodes[i], '') || changed;
+                }
+            }
+        }
+
+        const afterNodes = allTextNodes.slice(idxPlan + 1);
+        if (afterNodes.length > 0) {
+            if (afterNodes[0].nodeValue !== '，即可让智能体生成计划') {
+                changed = replaceTextNode(afterNodes[0], '，即可让智能体生成计划') || changed;
+            }
+            for (let i = 1; i < afterNodes.length; i++) {
+                if (afterNodes[i].nodeValue !== '') {
+                    changed = replaceTextNode(afterNodes[i], '') || changed;
+                }
+            }
+        }
+
+        return changed;
+    }
+
+    function getCustomizationBudgetTranslation(value) {
+        const match = norm(value).match(/^(\\d+(?:\\.\\d+)?)%\\s+of the customization budget is available[.。]?$/i);
+        return match ? match[1] + "% 的个性化定制预算可用" : null;
+    }
+
+    function getArtifactFileCountTranslation(value) {
+        const match = norm(value).match(/^Artifacts\\s*\\((\\d+)\\s+Files?\\s+for\\s+Conversation\\)$/i);
+        return match ? "交付件（本会话有 " + match[1] + " 个文件）" : null;
+    }
+
+    function getCommandInputStatusTranslation(value) {
+        const match = norm(value).match(/^(Rejected sending|Sent|Suggested sending|Error sending|Sending)\\s+(termination request|input)\\s+to command$/i);
+        if (!match) return null;
+
+        const item = match[2].toLowerCase() === "termination request" ? "终止请求" : "输入";
+        switch (match[1].toLowerCase()) {
+            case "rejected sending": return "已拒绝向命令发送" + item;
+            case "sent": return "已向命令发送" + item;
+            case "suggested sending": return "建议向命令发送" + item;
+            case "error sending": return "向命令发送" + item + "时出错";
+            case "sending": return "正在向命令发送" + item;
+            default: return null;
+        }
+    }
+
+    function translateDynamicSubagentStatusContainer(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE || isInBlockedZone(element)) return false;
+        const textNodes = collectTextNodes(element);
+        if (textNodes.length === 0 || textNodes.some(textNode => isInBlockedZone(textNode))) return false;
+        const original = textNodes.map(textNode => textNode.nodeValue || '').join('');
+        const translated = getDynamicSubagentStatusTranslation(original);
+        if (!translated || norm(original) === translated) return false;
+
+        if (Array.from(element.children || []).some(child => {
+            return !!getDynamicSubagentStatusTranslation(child.textContent || '');
+        })) return false;
+
+        const killedMatch = norm(original).match(/^(?:Killed|已中止)\\s+(\\d+)\\s+subagents?(?:\\s*([>›❯〉→]))?$/i);
+        if (killedMatch && textNodes.length > 1) {
+            const countIndex = textNodes.findIndex(textNode => /^\\s*\\d+\\s*$/.test(textNode.nodeValue || ''));
+            if (countIndex > 0) {
+                const prefixIndex = textNodes.findIndex((textNode, index) => {
+                    return index < countIndex && /^(?:Killed|已中止)$/i.test(norm(textNode.nodeValue || ''));
+                });
+                const suffixIndex = textNodes.findIndex((textNode, index) => {
+                    return index > countIndex && /^subagents?(?:\\s*[>›❯〉→])?$/i.test(norm(textNode.nodeValue || ''));
+                });
+                if (prefixIndex >= 0 && suffixIndex >= 0) {
+                    const hasSeparateMarker = textNodes.some((textNode, index) => {
+                        return index > suffixIndex && /^[>›❯〉→]$/.test(norm(textNode.nodeValue || ''));
+                    });
+                    for (let i = 0; i < textNodes.length; i++) {
+                        const nodeText = norm(textNodes[i].nodeValue || '');
+                        if (i === prefixIndex) replaceTextNode(textNodes[i], "已中止 ");
+                        else if (i === countIndex) replaceTextNode(textNodes[i], killedMatch[1]);
+                        else if (i === suffixIndex) replaceTextNode(textNodes[i], " 个子智能体" + (killedMatch[2] && !hasSeparateMarker ? " " + killedMatch[2] : ""));
+                        else if (/^[>›❯〉→]$/.test(nodeText)) replaceTextNode(textNodes[i], " " + nodeText);
+                        else replaceTextNode(textNodes[i], '');
+                    }
+                    return true;
+                }
+            }
+
+            const countWithUnitIndex = textNodes.findIndex(textNode => /^\\s*\\d+\\s+subagents?(?:\\s*[>›❯〉→])?\\s*$/i.test(textNode.nodeValue || ''));
+            if (countWithUnitIndex > 0) {
+                const prefixIndex = textNodes.findIndex((textNode, index) => {
+                    return index < countWithUnitIndex && /^(?:Killed|已中止)$/i.test(norm(textNode.nodeValue || ''));
+                });
+                if (prefixIndex >= 0) {
+                    const hasSeparateMarker = textNodes.some((textNode, index) => {
+                        return index > countWithUnitIndex && /^[>›❯〉→]$/.test(norm(textNode.nodeValue || ''));
+                    });
+                    for (let i = 0; i < textNodes.length; i++) {
+                        const nodeText = norm(textNodes[i].nodeValue || '');
+                        if (i === prefixIndex) replaceTextNode(textNodes[i], "已中止");
+                        else if (i === countWithUnitIndex) replaceTextNode(textNodes[i], " " + killedMatch[1] + " 个子智能体" + (killedMatch[2] && !hasSeparateMarker ? " " + killedMatch[2] : ""));
+                        else if (/^[>›❯〉→]$/.test(nodeText)) replaceTextNode(textNodes[i], " " + nodeText);
+                        else replaceTextNode(textNodes[i], '');
+                    }
+                    return true;
+                }
+            }
+        }
+
+        const combinedRunMatch = norm(original).match(/^(\\d+)\\s+subagents?\\s*\\/\\s*tasks?\\s+running$/i);
+        const countIndex = combinedRunMatch
+            ? textNodes.findIndex(textNode => /^\\s*\\d+\\s*$/.test(textNode.nodeValue || ''))
+            : -1;
+        if (countIndex >= 0 && textNodes.length > 1) {
+            const suffixIndex = textNodes.findIndex((textNode, index) => {
+                return index > countIndex && norm(textNode.nodeValue || '');
+            });
+            if (suffixIndex >= 0) {
+                for (let i = 0; i < textNodes.length; i++) {
+                    if (i === countIndex) replaceTextNode(textNodes[i], combinedRunMatch[1]);
+                    else if (i === suffixIndex) replaceTextNode(textNodes[i], " 个子智能体/任务正在运行");
+                    else replaceTextNode(textNodes[i], '');
+                }
+                return true;
+            }
+        }
+
+        replaceTextNode(textNodes[0], translated);
+        for (let i = 1; i < textNodes.length; i++) replaceTextNode(textNodes[i], '');
+        return true;
+    }
+
+    function translateBusinessSsoOrDivider(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE || isInBlockedZone(element)) return false;
+        if (element.tagName.toUpperCase() !== 'SPAN' || norm(element.textContent) !== 'OR') return false;
+
+        const className = typeof element.className === 'string' ? element.className : '';
+        const hasClass = (classes, classToken) => new RegExp('(?:^|\\\\s)' + classToken + '(?:\\\\s|$)').test(classes);
+        if (!hasClass(className, 'uppercase') || !hasClass(className, 'select-none')) return false;
+
+        const parent = element.parentElement;
+        if (!parent) return false;
+        const dividerCount = Array.from(parent.children || []).filter(sibling => {
+            if (!sibling || sibling === element || sibling.tagName?.toUpperCase() !== 'DIV') return false;
+            const siblingClasses = typeof sibling.className === 'string' ? sibling.className : '';
+            return hasClass(siblingClasses, 'flex-1') && hasClass(siblingClasses, 'h-px');
+        }).length;
+        if (dividerCount !== 2) return false;
+
+        const textNodes = collectTextNodes(element);
+        if (textNodes.length !== 1) return false;
+        replaceTextNode(textNodes[0], '或');
+        return true;
+    }
+
+    function translateSettingOverrides(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE || isInBlockedZone(element)) return false;
+        const rawText = element.textContent || '';
+        if (!/(?:Modified\\s+in|Also\\s+modified\\s+in|修改于|也修改于)/i.test(rawText)) return false;
+
+        let targetContainer = null;
+        let current = element;
+        for (let depth = 0; current && depth < 4; depth++) {
+            if (current === document.body || current === document.documentElement) break;
+            if (current.nodeType === Node.ELEMENT_NODE &&
+                /(?:^|\\s)inline-block(?:\\s|$)/.test(current.className || '') &&
+                /(?:Modified\\s+in|Also\\s+modified\\s+in|修改于|也修改于)/i.test(current.textContent || '')) {
+                targetContainer = current;
+                break;
+            }
+            current = current.parentElement || (current.getRootNode?.().host ?? null);
+        }
+        if (!targetContainer) {
+            targetContainer = element;
+        }
+
+        const textNodes = collectTextNodes(targetContainer);
+        if (textNodes.length === 0) return false;
+
+        const prefixIndex = textNodes.findIndex(node => /^(?:Also\\s+modified|Modified)\\s+in$/i.test(norm(node.nodeValue)));
+        const alreadyPrefixIndex = prefixIndex >= 0 ? prefixIndex : textNodes.findIndex(node => /^(?:也修改于|修改于)$/i.test(norm(node.nodeValue)));
+        const activePrefixIndex = prefixIndex >= 0 ? prefixIndex : alreadyPrefixIndex;
+        if (activePrefixIndex < 0) return false;
+
+        let isAlso = false;
+        const prefixVal = norm(textNodes[activePrefixIndex].nodeValue);
+        if (/^Also/i.test(prefixVal) || /^也修改于$/i.test(prefixVal)) {
+            isAlso = true;
+        }
+
+        let translated = false;
+        const targetPrefix = (isAlso ? "也修改于" : "修改于") + " ";
+        if (textNodes[activePrefixIndex].nodeValue !== targetPrefix) {
+            replaceTextNode(textNodes[activePrefixIndex], targetPrefix);
+            translated = true;
+        }
+
+        for (let i = activePrefixIndex + 1; i < textNodes.length; i++) {
+            const tNode = textNodes[i];
+            const val = norm(tNode.nodeValue);
+            if (!val) continue;
+
+            const countMatch = val.match(/^(\\d+)\\s*(?:projects?|个?项目|workspaces?|个?工作区)\\s*$/i);
+            if (countMatch) {
+                const countTrans = countMatch[1] + " 个项目";
+                if (tNode.nodeValue !== countTrans) {
+                    replaceTextNode(tNode, countTrans);
+                    translated = true;
+                }
+                if (i + 1 < textNodes.length) {
+                    const nextVal = norm(textNodes[i + 1].nodeValue);
+                    if (/^(?:projects?|个?项目|workspaces?|个?工作区)$/i.test(nextVal)) {
+                        replaceTextNode(textNodes[i + 1], '');
+                        translated = true;
+                    }
+                }
+                break;
+            }
+
+            if (/^\\d+$/.test(val) && i + 1 < textNodes.length) {
+                const nextVal = norm(textNodes[i + 1].nodeValue);
+                if (/^(?:projects?|个?项目|workspaces?|个?工作区)$/i.test(nextVal)) {
+                    const countTrans = val + " 个项目";
+                    replaceTextNode(tNode, countTrans);
+                    replaceTextNode(textNodes[i + 1], '');
+                    translated = true;
+                    break;
+                }
+            }
+
+            if (/^untitled\\s+project$/i.test(val)) {
+                if (tNode.nodeValue !== '无标题项目') {
+                    replaceTextNode(tNode, '无标题项目');
+                    translated = true;
+                }
+                break;
+            }
+
+            if (/^outside\\s+of\\s+project$/i.test(val)) {
+                if (tNode.nodeValue !== '项目外部') {
+                    replaceTextNode(tNode, '项目外部');
+                    translated = true;
+                }
+                break;
+            }
+        }
+
+        return translated;
+    }
+
+    function translateSpecialContainers(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE || isInBlockedZone(element)) return false;
+        if (!element.childNodes || element.childNodes.length === 0) return false;
+
+        const rawText = element.textContent || '';
+        const textLength = rawText.length;
+        let translated = false;
+
+        if (textLength <= 160 && /(?:(?:Also\\s+modified|Modified)\\s+in|修改于|也修改于)/i.test(rawText)) {
+            translated = translateSettingOverrides(element) || translated;
+        }
+
+        if (textLength <= 300 && /(?:archived conversations?|已归档.*(?:会话|对话)|^(?:History|历史记录)[.。]?$)/i.test(rawText.trim())) {
+            translated = translateArchivedConversationNotice(element) || translated;
+        }
+        if (textLength <= 320 && /(?:Input disabled because|输入已禁用[，,]因为|does not exist|Create the folder in this)/i.test(rawText)) {
+            translated = translateInputDisabledNotice(element) || translated;
+        }
+        if (textLength <= 80 && /(?:Show\\s+\\d+\\s+more|显示另外\\s+\\d+\\s+个)/i.test(rawText)) {
+            translated = translateShowMoreStatus(element) || translated;
+        }
+        if (textLength <= 1600 && /(?:baseline quota|基础配额)/i.test(rawText)) {
+            translated = translateBaselineQuotaNotice(element) || translated;
+        }
+        if (textLength <= 800 && /(?:weekly limit|每周配额)/i.test(rawText)) {
+            translated = translateQuotaNoticeContainer(element) || translated;
+        }
+        if (textLength <= 1400 && /(?:quick question without interrupting|align on a plan|team of agents to autonomously|recent successes or corrections|Boost multi-agent orchestrator|Antigravity Customization System|comprehensive guide, quick reference, and sitemap|render rich interactive HTML widgets|scheduled background automation|manage and create plugins|namespaced bundles of skills|不中断主会话|通过访谈与我对齐|智能体团队自主应对|反思最近的成功或改进|Boost 多智能体编排器|个性化定制系统的综合指南|全面指南、快速参考和网站地图|交互式 HTML 小组件|定时后台自动化|计划后台自动化|管理和创建插件)/i.test(rawText)) {
+            translated = translateSkillPickerEntry(element) || translated;
+        }
+        if (textLength <= 240 &&
+            /(?:\\bCommit\\b|提交)/i.test(rawText) &&
+            /(?:files?\\s*changes?|个文件.*更改)/i.test(rawText) &&
+            /(?:\\bto\\b|提交到)/i.test(rawText)) {
+            translated = (translateCommitSummaryContainer(element) === true) || translated;
+        }
+        if (textLength <= 80 && /(?:Working|处理中|工作中)/i.test(rawText)) {
+            translated = translateAgentLoadingStatus(element) || translated;
+            translated = translateWorkingStatusContainer(element) || translated;
+        }
+        if (textLength <= 120 && /(?:\\bresults?\\b|个结果|(?:Comments?|评论)\\s*[（(]\\s*\\d+|(?:\\d+\\s+)?(?:Side Questions?|侧边提问)(?:\\s*[（(]\\s*\\d+|\\b)|Listed|列出了|\\bsubagents?\\b|子智能体|See all|显示全部)/i.test(rawText)) {
+            translated = translateCompactCountLabelContainer(element) || translated;
+        }
+        if (textLength <= 240 &&
+            /(?:\\bsubagents?\\b|子智能体|^Found\\s+(?:\\d+|Browsers?|浏览器)|^Timed\\s+\\d+|Messaged\\s+Root\\s+Agent|^Message\\s+from\\s+(?:Root\\s+Agent|主智能体)|^Error\\s+from\\s+|\\btasks?\\s+running\\b|\\bactive\\s+goals?\\b|^Goals?\\s+\\d+|\\bquestions?\\b)/i.test(rawText.trim())) {
+            translated = translateDynamicSubagentStatusContainer(element) || translated;
+        }
+        if (textLength <= 600 &&
+            /(?:Permanently delete|\\bincluding\\b|\\bactive conversations?\\b|\\barchived conversations?\\b|永久删除|，包含)/i.test(rawText)) {
+            translated = translateProjectDeleteSummary(element) || translated;
+        }
+        if (textLength <= 600 &&
+            /(?:This will permanently delete|这将永久删除|within it)/i.test(rawText) &&
+            /(?:active (?:conversations?|chats?)|archived (?:conversations?|chats?)|个活跃会话|个已归档会话|within it)/i.test(rawText)) {
+            translated = translatePermanentlyDeleteNotice(element) || translated;
+        }
+        if (textLength <= 600 &&
+            /(?:This will archive|这将归档)/i.test(rawText) &&
+            /(?:conversations?|chats?|会话|within it)/i.test(rawText)) {
+            translated = translateArchiveNotice(element) || translated;
+        }
+        if (textLength <= 500 &&
+            /(?:Configure the browser subagent|配置浏览器子智能体)/i.test(rawText) &&
+            /(?:Google Chrome|to be installed)/i.test(rawText)) {
+            translated = translateBrowserSubagentNotice(element) || translated;
+        }
+        if (element.getAttribute?.('data-testid') === 'plan-command-fyi-alert' ||
+            element.querySelector?.('[data-testid="plan-command-fyi-alert"]') ||
+            (textLength <= 250 && /(?:Type|类型|键入)\\s*\\/\\s*(?:and\\s+select|并选择)\\s*plan/i.test(rawText))) {
+            translated = translatePlanCommandAlert(element) || translated;
+        }
+        if (textLength <= 300 &&
+            /(?:Visit|访问)\\s*(?:Legal Help|法律帮助)/i.test(rawText) &&
+            /(?:to ask for content changes for legal reasons|出于法律原因)/i.test(rawText)) {
+            translated = translateLegalHelpNotice(element) || translated;
+        }
+        if (textLength <= 8 && element.tagName?.toUpperCase() === 'SPAN' && /^OR$/i.test(rawText.trim())) {
+            translated = translateBusinessSsoOrDivider(element) || translated;
+        }
+        return translated;
+    }
+
+    function getCombinedStatusTranslation(value) {
+        const normalized = norm(value);
+        if (!normalized) return null;
+        if (map.has(normalized)) return map.get(normalized);
+        if (lowerMap.has(normalized.toLowerCase())) return lowerMap.get(normalized.toLowerCase());
+
+        const versionControlTranslation = getVersionControlUiTranslation(normalized);
+        if (versionControlTranslation) return versionControlTranslation;
+
+        const workingStatusTranslation = getWorkingStatusTranslation(normalized);
+        if (workingStatusTranslation) return workingStatusTranslation;
+
+        const compactCountLabelTranslation = getCompactCountLabelTranslation(normalized);
+        if (compactCountLabelTranslation) return compactCountLabelTranslation;
+
+        const artifactTimestampTranslation = getArtifactTimestampTranslation(normalized);
+        if (artifactTimestampTranslation) return artifactTimestampTranslation;
+
+        const quotaNoticeTranslation = getQuotaNoticeTranslation(normalized);
+        if (quotaNoticeTranslation) return quotaNoticeTranslation;
+
+        const archivedConversationNoticeTranslation = getArchivedConversationNoticeTranslation(normalized);
+        if (archivedConversationNoticeTranslation) return archivedConversationNoticeTranslation;
+
+        const baselineQuotaTranslation = getBaselineQuotaRefreshTranslation(normalized);
+        if (baselineQuotaTranslation) return baselineQuotaTranslation;
+
+        const subagentStatusTranslation = getDynamicSubagentStatusTranslation(normalized);
+        if (subagentStatusTranslation) return subagentStatusTranslation;
+
+        const bracketedTaskStatusTranslation = getBracketedTaskStatusTranslation(normalized);
+        if (bracketedTaskStatusTranslation) return bracketedTaskStatusTranslation;
+
+        const productUiTranslation = getDynamicProductUiTranslation(normalized);
+        if (productUiTranslation) return productUiTranslation;
+
+        const projectDeleteSummaryTranslation = getProjectDeleteSummaryTranslation(normalized);
+        if (projectDeleteSummaryTranslation) return projectDeleteSummaryTranslation;
+
+        const customizationBudgetTranslation = getCustomizationBudgetTranslation(normalized);
+        if (customizationBudgetTranslation) return customizationBudgetTranslation;
+
+        const artifactFileCountTranslation = getArtifactFileCountTranslation(normalized);
+        if (artifactFileCountTranslation) return artifactFileCountTranslation;
+
+        const commandInputStatusTranslation = getCommandInputStatusTranslation(normalized);
+        if (commandInputStatusTranslation) return commandInputStatusTranslation;
+
+        const relativeTimeTranslation = getRelativeTimeTranslation(normalized);
+        if (relativeTimeTranslation) return relativeTimeTranslation;
+
+        const showMoreMatch = normalized.match(/^Show\\s+(\\d+)\\s+more(?:\\.\\.\\.|…)?$/i);
+        if (showMoreMatch) return "显示另外 " + showMoreMatch[1] + " 个...";
+
+        const geminiAvailableMatch = normalized.match(/^Gemini\\s+(.+?)\\s+is now available$/i);
+        if (geminiAvailableMatch) return "Gemini " + geminiAvailableMatch[1] + " 现已可用";
+
+        const exploredTrans = translateExploredStatus(normalized);
+        if (exploredTrans) return exploredTrans;
+
+        const toolMatch = normalized.match(/^(\\d+)\\s+tools?\\s+enabled$/i);
+        if (toolMatch) return toolMatch[1] + " 个工具已启用";
+
+        const scheduleMatch = normalized.match(/^All scheduled tasks run (?:as|with the)\\s+(.+?)(?:\\s+model)?[.。]?$/i);
+        if (scheduleMatch) {
+            const model = scheduleMatch[1].replace(/[.。]+$/, '').trim();
+            if (model) return "所有计划任务均以 " + model + " 模型运行";
+        }
+        const viewArchivedHistMatch = normalized.match(/^View(?:\\s+(\\d+))?\\s+archived conversations?\\s+in\\s+History[.。]?$/i);
+        if (viewArchivedHistMatch) {
+            return viewArchivedHistMatch[1]
+                ? "在“历史记录”中查看 " + viewArchivedHistMatch[1] + " 个已归档会话"
+                : "可在“历史记录”中查看已归档的会话";
+        }
+        const viewArchivedMatch = normalized.match(/^View(?:\\s+(\\d+))?\\s+archived conversations?(?:\\s+in)?$/i);
+        if (viewArchivedMatch) {
+            const countText = viewArchivedMatch[1] ? " " + viewArchivedMatch[1] + " 个" : "";
+            return "查看" + countText + "已归档会话" + (/in$/i.test(normalized) ? "，请前往 " : "");
+        }
+
+        return null;
+    }
+
+    function translateCombinedTextChildren(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE || isInBlockedZone(element)) {
+            return false;
+        }
+        if (isReasoningBodyNode(element)) return false;
+
+        if (getCompactCountLabelTranslation(element.textContent || '')) return false;
+
+        let textRun = [];
+        const translateRun = () => {
+            if (textRun.length < 2) return false;
+            const original = textRun.map(textNode => textNode.nodeValue || '').join('');
+            const translated = getCombinedStatusTranslation(original);
+            if (!translated || translated === original) return false;
+            replaceTextNode(textRun[0], translated);
+            for (let i = 1; i < textRun.length; i++) replaceTextNode(textRun[i], '');
+            return true;
+        };
+
+        for (const child of element.childNodes) {
+            if (child.nodeType === Node.TEXT_NODE) {
+                textRun.push(child);
+                continue;
+            }
+            if (translateRun()) return true;
+            textRun = [];
+        }
+        return translateRun();
+    }
+
+    function translateQuestionnaireOptionLabel(node, value) {
+        const normalized = norm(value);
+        const bilingualMatch = normalized.match(/^(.+?[\\u3400-\\u9fff].*?)\\s*[（(]([A-Za-z][A-Za-z0-9 .,'’/&+:#-]*)[)）]$/);
+        if (!bilingualMatch) return null;
+
+        let current = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+        let optionRow = null;
+        for (let depth = 0; current && depth < 6; depth++) {
+            const rowText = norm(current.textContent);
+            const isCompactLabelRow = rowText.endsWith(normalized)
+                && rowText.length <= normalized.length + 32;
+            const isInteractive = isCompactLabelRow
+                && current.matches?.('button, [role="button"], [role="option"], [role="radio"], [role="checkbox"], [tabindex]');
+            const isNumberedRow = isCompactLabelRow && /^\\d+\\s*/.test(rowText);
+            if (isInteractive || isNumberedRow) {
+                optionRow = current;
+                break;
+            }
+            current = current.parentElement || (current.getRootNode?.().host ?? null);
+        }
+        if (!optionRow) return null;
+
+        current = optionRow.parentElement || (optionRow.getRootNode?.().host ?? null);
+        for (let depth = 0; current && depth < 10; depth++) {
+            if (current === document.body || current === document.documentElement) break;
+            const cardText = norm(current.textContent);
+            const hasProgress = /\\b\\d+\\s+of\\s+\\d+\\b/i.test(cardText);
+            const hasActions = /(?:Skip|跳过)/i.test(cardText) && /(?:Continue|继续)/i.test(cardText);
+            if (cardText.length <= 4000 && hasProgress && hasActions) return bilingualMatch[1].trim();
+            current = current.parentElement || (current.getRootNode?.().host ?? null);
+        }
+        return null;
+    }
+
+    function translateFragmentedStatus(node, originalVal) {
+        const currentText = norm(originalVal);
+        const previous = findPreviousTextNode(node);
+        const previousText = previous ? norm(previous.nodeValue) : '';
+
+        if (/^to be installed\\.?$/i.test(currentText)) {
+            const parentText = node && node.parentElement ? (node.parentElement.textContent || '') : '';
+            if (/^Google Chrome$/i.test(previousText) || /(?:browser subagent|浏览器子智能体|Google Chrome)/i.test(parentText)) {
+                return "。";
+            }
+        }
+        if (/^to ask for content changes for legal reasons[.。]?$/i.test(currentText)) {
+            const parentText = node && node.parentElement ? (node.parentElement.textContent || '') : '';
+            if (/^(?:Legal Help|法律帮助)$/i.test(previousText) || /(?:Legal Help|法律帮助)/i.test(parentText)) {
+                return " 页面";
+            }
+        }
+        if (/^Visit$/i.test(currentText)) {
+            const parentText = node && node.parentElement ? (node.parentElement.textContent || '') : '';
+            if (/(?:Legal Help|法律帮助)/i.test(parentText) && /(?:to ask for content changes for legal reasons|出于法律原因)/i.test(parentText)) {
+                return "若出于法律原因需要申请更改内容，请访问 ";
+            }
+        }
+        const toBeInstalledMatch = currentText.match(/^to be installed\\.\\s*(.+)$/i);
+        if (toBeInstalledMatch) {
+            const parentText = node && node.parentElement ? (node.parentElement.textContent || '') : '';
+            if (/^Google Chrome$/i.test(previousText) || /(?:browser subagent|浏览器子智能体|Google Chrome)/i.test(parentText)) {
+                const rest = toBeInstalledMatch[1];
+                const restTrans = map.get(norm(rest)) || lowerMap.get(norm(rest).toLowerCase()) || rest;
+                return "。" + restTrans;
+            }
+        }
+
+        const commentCountMatch = currentText.match(/^[（(]\\s*(\\d+)\\s*[)）]$/);
+        if (commentCountMatch && /^(?:Comments?|评论)$/i.test(previousText)) {
+            replaceTextNode(previous, "评论");
+            return "（" + commentCountMatch[1] + "）";
+        }
+
+        const statusItemMatch = currentText.match(new RegExp('^(files?|folders?|pages?|search(?:es)?|tasks?|commands?|tools?|rules?|repos(?:itories)?|images?|actions?)(\\s*,\\s*|\\s*' + EXPLORED_STATUS_SUFFIX + ')?$', 'i'));
+        if (statusItemMatch && previous) {
+            const unit = getExploredStatusUnit(statusItemMatch[1]);
+            const tail = statusItemMatch[2] || '';
+            const translatedTail = /,/.test(tail) ? '、' : tail;
+            const prefixedCount = previousText.match(/^(?:Explored|探索了)\\s+(\\d+)$/i);
+            if (prefixedCount) {
+                replaceTextNode(previous, "探索了 " + prefixedCount[1]);
+                return " " + unit + translatedTail;
+            }
+            const prefixedRanCount = previousText.match(/^(?:ran|运行了)\\s+(\\d+)$/i);
+            if (prefixedRanCount) {
+                replaceTextNode(previous, "运行了 " + prefixedRanCount[1]);
+                return " " + unit + translatedTail;
+            }
+            if (/^\\d+$/.test(previousText)) return " " + unit + translatedTail;
+        }
+
+        let statusMatch = currentText.match(/^(?:subagents?|子智能体)(?:\\s*([>›❯〉→]))?$/i);
+        if (statusMatch && /^Found$/i.test(previousText)) {
+            replaceTextNode(previous, "已找到");
+            return "子智能体" + (statusMatch[1] ? " " + statusMatch[1] : "");
+        }
+
+        statusMatch = currentText.match(/^(?:Browsers?|浏览器)(?:\\s*([>›❯〉→]))?$/i);
+        if (statusMatch && /^Found$/i.test(previousText)) {
+            replaceTextNode(previous, "已找到");
+            return "浏览器" + (statusMatch[1] ? " " + statusMatch[1] : "");
+        }
+
+        statusMatch = currentText.match(/^(\\d+)\\s+subagents?(?:\\s*([>›❯〉→]))?$/i);
+        if (statusMatch && /^Found$/i.test(previousText)) {
+            replaceTextNode(previous, "找到");
+            return " " + statusMatch[1] + " 个子智能体" + (statusMatch[2] ? " " + statusMatch[2] : "");
+        }
+        if (statusMatch && /^(?:Killed|已中止)$/i.test(previousText)) {
+            replaceTextNode(previous, "已中止");
+            return " " + statusMatch[1] + " 个子智能体" + (statusMatch[2] ? " " + statusMatch[2] : "");
+        }
+        statusMatch = currentText.match(/^subagents?(?:\\s*([>›❯〉→]))?$/i);
+        if (statusMatch && /^\\d+$/.test(previousText)) {
+            const foundNode = findPreviousTextNode(previous);
+            if (foundNode && /^Found$/i.test(norm(foundNode.nodeValue))) {
+                replaceTextNode(foundNode, "找到 ");
+                return " 个子智能体" + (statusMatch[1] ? " " + statusMatch[1] : "");
+            }
+            if (foundNode && /^(?:Killed|已中止)$/i.test(norm(foundNode.nodeValue))) {
+                replaceTextNode(foundNode, "已中止 ");
+                return " 个子智能体" + (statusMatch[1] ? " " + statusMatch[1] : "");
+            }
+        }
+
+        statusMatch = currentText.match(/^(\\d+)\\s+(seconds?|minutes?|hours?)(?:\\s*([>›❯〉→]))?$/i);
+        if (statusMatch && /^Timed$/i.test(previousText)) {
+            const unit = /^second/i.test(statusMatch[2]) ? "秒" : /^minute/i.test(statusMatch[2]) ? "分钟" : "小时";
+            replaceTextNode(previous, "耗时");
+            return " " + statusMatch[1] + " " + unit + (statusMatch[3] ? " " + statusMatch[3] : "");
+        }
+        statusMatch = currentText.match(/^(seconds?|minutes?|hours?)(?:\\s*([>›❯〉→]))?$/i);
+        if (statusMatch && /^\\d+$/.test(previousText)) {
+            const timedNode = findPreviousTextNode(previous);
+            if (timedNode && /^Timed$/i.test(norm(timedNode.nodeValue))) {
+                const unit = /^second/i.test(statusMatch[1]) ? "秒" : /^minute/i.test(statusMatch[1]) ? "分钟" : "小时";
+                replaceTextNode(timedNode, "耗时 ");
+                return " " + unit + (statusMatch[2] ? " " + statusMatch[2] : "");
+            }
+        }
+
+        statusMatch = currentText.match(/^Root\\s+Agent(?:\\s*([>›❯〉→]))?$/i);
+        if (statusMatch && /^Messaged$/i.test(previousText)) {
+            replaceTextNode(previous, "已向");
+            return "主智能体发送消息" + (statusMatch[1] ? " " + statusMatch[1] : "");
+        }
+
+        statusMatch = currentText.match(/^(\\d+)\\s+active\\s+goals?$/i);
+        if (statusMatch && /^(\\d+)\\s+tasks?\\s+running,?$/i.test(previousText)) {
+            const taskCount = previousText.match(/^(\\d+)/)[1];
+            replaceTextNode(previous, taskCount + " 个任务正在运行，");
+            return statusMatch[1] + " 个活跃目标";
+        }
+        if (/^active\\s+goals?$/i.test(currentText) && /^\\d+$/.test(previousText)) {
+            return " 个活跃目标";
+        }
+
+        if (/^found$/i.test(currentText) && previousText === "项目") {
+            const noNode = findPreviousTextNode(previous);
+            if (noNode && /^No$/i.test(norm(noNode.nodeValue))) {
+                replaceTextNode(noNode, '');
+                replaceTextNode(previous, "未找到项目");
+                return '';
+            }
+        }
+
+        if (/^(?:when not in a project|in this project|in this workspace|in this conversation)$/i.test(currentText) && previous) {
+            const isAllow = /^(?:Yes, and always allow|是，且始终允许)$/i.test(previousText);
+            const isSaveRule = /^(?:Yes, save rule|是，保存规则)$/i.test(previousText);
+            if (isAllow || isSaveRule) {
+                let scopeTrans = "";
+                if (/^in this project$/i.test(currentText)) scopeTrans = "在此项目中";
+                else if (/^when not in a project$/i.test(currentText)) scopeTrans = "在不属于任何项目时";
+                else if (/^in this workspace$/i.test(currentText)) scopeTrans = "在此工作区中";
+                else if (/^in this conversation$/i.test(currentText)) scopeTrans = "在此会话中";
+
+                if (isAllow) {
+                    replaceTextNode(previous, "是，且" + scopeTrans + "始终允许");
+                } else {
+                    replaceTextNode(previous, "是，" + scopeTrans + "保存规则");
+                }
+                return '';
+            }
+        }
+
+        if (/^s\\s+enabled$/i.test(currentText) && previous) {
+            const countAndTool = previousText.match(/^(\\d+)\\s+tools?$/i);
+            if (countAndTool) {
+                replaceTextNode(previous, countAndTool[1] + " 个工具已启用");
+                return '';
+            }
+        }
+
+        const isEnabledSuffix = /^s\\s+enabled$/i.test(currentText) || /^enabled$/i.test(currentText);
+        if (isEnabledSuffix && previous) {
+            let toolNode = previous;
+            let toolText = previousText;
+
+            if (/^s$/i.test(toolText) && /^enabled$/i.test(currentText)) {
+                toolNode = findPreviousTextNode(previous);
+                toolText = toolNode ? norm(toolNode.nodeValue) : '';
+                replaceTextNode(previous, '');
+            }
+
+            const countNode = toolNode ? findPreviousTextNode(toolNode) : null;
+            const countText = countNode ? norm(countNode.nodeValue) : '';
+            if (/^(?:tool|tools|工具)$/i.test(toolText) && /^\\d+$/.test(countText)) {
+                replaceTextNode(toolNode, '');
+                return " 个工具已启用";
+            }
+        }
+
+        if (previousText === "所有计划任务均以" && currentText && !/[\\u4e00-\\u9fff]/.test(currentText)) {
+            const model = currentText.replace(/[.。]+$/, '').trim();
+            if (model) return model + " 模型运行";
+        }
+
+        if (/^[.。]$/.test(currentText) && /模型运行$/.test(previousText)) {
+            return '';
+        }
+
+        if (/^\\?\\s*(?:This action cannot be undone\\.?)?$/i.test(currentText) && previous) {
+            let candidate = previous;
+            for (let i = 0; i < 6 && candidate; i++) {
+                if (/^您确定要删除(?:计划)?任务$/.test(norm(candidate.nodeValue))) {
+                    return /This action cannot be undone/i.test(currentText)
+                        ? " 吗？此操作无法撤销"
+                        : " 吗？";
+                }
+                candidate = findPreviousTextNode(candidate);
+            }
+        }
+
+        if (currentText === '?' && previous) {
+            let candidate = previous;
+            let hasProjectScope = false;
+            for (let i = 0; i < 8 && candidate; i++) {
+                const candidateText = norm(candidate.nodeValue);
+                if (/^(?:project|workspace|项目|工作区)$/i.test(candidateText)) {
+                    hasProjectScope = true;
+                } else if (candidateText === "您确定要删除" && hasProjectScope) {
+                    return " 吗？";
+                }
+                candidate = findPreviousTextNode(candidate);
+            }
+        }
+
+        if (/^in$/i.test(currentText) && (previousText === "个已归档会话" || previousText === "已归档会话" || previousText === "个已归档对话" || previousText === "已归档对话" || previousText === "archived conversation" || previousText === "archived conversations")) {
+            let viewNode = findPreviousTextNode(previous);
+            let hasNumber = false;
+            if (viewNode && /^\\d+$/.test(norm(viewNode.nodeValue))) {
+                hasNumber = true;
+                viewNode = findPreviousTextNode(viewNode);
+            }
+            const articleNodes = [];
+            while (viewNode && /^(?:a|an|个)$/i.test(norm(viewNode.nodeValue))) {
+                articleNodes.push(viewNode);
+                viewNode = findPreviousTextNode(viewNode);
+            }
+            if (viewNode && /^(?:View|视图|查看)$/i.test(norm(viewNode.nodeValue))) {
+                for (const articleNode of articleNodes) replaceTextNode(articleNode, '');
+                replaceTextNode(viewNode, "查看");
+                if (!hasNumber) {
+                    replaceTextNode(previous, "已归档的会话");
+                }
+                return "，请前往 ";
+            }
+        }
+
+        return null;
+    }
+
+    function translateNode(node, parentContainersScanned = false) {
+        try {
+            if (!node) return;
+
+            if (node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+                for (const child of node.childNodes) translateNode(child);
+                return;
+            }
+
+            if (node.nodeType === Node.ELEMENT_NODE) {
+                const tag = node.tagName.toUpperCase();
+
+                let isBlocked = BLOCKED_TAGS.includes(tag);
+                if (!isBlocked) {
+                    const className = node.className || '';
+                    if (typeof className === 'string') {
+                        if (BLOCKED_CLASSES.some(cls => className.includes(cls))) {
+                            isBlocked = true;
+                        }
+                    }
+                }
+                if (node.getAttribute('contenteditable') === 'true') {
+                    isBlocked = true;
+
+                    for (const attr of ['placeholder', 'aria-placeholder', 'data-placeholder', 'aria-label', 'title']) {
+                        const value = node.getAttribute(attr);
+                        if (!value) continue;
+                        const normalizedValue = norm(value);
+                        const chromeUiTranslation = getChromeUiTranslation(node, normalizedValue);
+                        const shortcutTranslation = translateWithShortcut(normalizedValue);
+                        const versionControlTranslation = getVersionControlUiTranslation(normalizedValue);
+                        let target = null;
+                        if (chromeUiTranslation) target = chromeUiTranslation;
+                        else if (versionControlTranslation) target = versionControlTranslation;
+                        else if (shortcutTranslation) target = shortcutTranslation;
+                        else if (map.has(normalizedValue)) target = map.get(normalizedValue);
+                        else if (lowerMap.has(normalizedValue.toLowerCase())) target = lowerMap.get(normalizedValue.toLowerCase());
+                        if (target && target !== value) node.setAttribute(attr, target);
+                    }
+                }
+
+                const shouldMarkBlocked = isBlocked &&
+                    (!BLOCKED_TAGS.includes(tag) || AUTO_TRANSLATE_PROTECTED_TAGS.has(tag));
+                if (shouldMarkBlocked) {
+                    if (node.getAttribute('translate') !== 'no') {
+                        node.setAttribute('translate', 'no');
+                    }
+                    try {
+                        if (!node.classList.contains('notranslate')) {
+                            node.classList.add('notranslate');
+                        }
+                    } catch (e) {}
+                }
+
+                if (BLOCKED_TAGS.includes(tag)) {
+                    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SVG') {
+                        for (const attr of ['placeholder', 'aria-placeholder', 'data-placeholder', 'title', 'aria-label']) {
+                            const v = node.getAttribute(attr);
+                            if (v) {
+                                const searchingTrans = getSearchingStatusTranslation(v);
+                                if (searchingTrans && searchingTrans !== v) {
+                                    node.setAttribute(attr, searchingTrans);
+                                } else if (!isInBlockedZone(node.parentElement)) {
+                                    const t = norm(v);
+                                    const chromeUiTrans = getChromeUiTranslation(node, t);
+                                    const shortcutTrans = translateWithShortcut(t);
+                                    const versionControlTrans = getVersionControlUiTranslation(t);
+                                    const dynamicSubagentTrans = getDynamicSubagentStatusTranslation(t);
+                                    const compactCountTrans = getCompactCountLabelTranslation(t);
+                                    let target = null;
+                                    if (chromeUiTrans) target = chromeUiTrans;
+                                    else if (versionControlTrans) target = versionControlTrans;
+                                    else if (dynamicSubagentTrans) target = dynamicSubagentTrans;
+                                    else if (compactCountTrans) target = compactCountTrans;
+                                    else if (shortcutTrans) target = shortcutTrans;
+                                    else if (map.has(t)) target = map.get(t);
+                                    else if (lowerMap.has(t.toLowerCase())) target = lowerMap.get(t.toLowerCase());
+                                    if (target && target !== v) node.setAttribute(attr, target);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                if (!isInBlockedZone(node)) {
+                    translateSpecialContainers(node);
+                    translateCombinedTextChildren(node);
+                    for (const attr of ['placeholder', 'aria-placeholder', 'data-placeholder', 'title', 'aria-label']) {
+                        const v = node.getAttribute(attr);
+                        if (v) {
+                            const searchingTrans = getSearchingStatusTranslation(v);
+                            if (searchingTrans && searchingTrans !== v) {
+                                node.setAttribute(attr, searchingTrans);
+                            } else {
+                                const t = norm(v);
+                                const chromeUiTrans = getChromeUiTranslation(node, t);
+                                const shortcutTrans = translateWithShortcut(t);
+                                const versionControlTrans = getVersionControlUiTranslation(t);
+                                const dynamicSubagentTrans = getDynamicSubagentStatusTranslation(t);
+                                const compactCountTrans = getCompactCountLabelTranslation(t);
+                                let target = null;
+                                if (chromeUiTrans) target = chromeUiTrans;
+                                else if (versionControlTrans) target = versionControlTrans;
+                                else if (dynamicSubagentTrans) target = dynamicSubagentTrans;
+                                else if (compactCountTrans) target = compactCountTrans;
+                                else if (shortcutTrans) target = shortcutTrans;
+                                else if (map.has(t)) target = map.get(t);
+                                else if (lowerMap.has(t.toLowerCase())) target = lowerMap.get(t.toLowerCase());
+                                if (target && target !== v) node.setAttribute(attr, target);
+                            }
+                        }
+                    }
+                } else {
+                    for (const attr of ['aria-label', 'title', 'placeholder']) {
+                        const v = node.getAttribute(attr);
+                        if (v) {
+                            const searchingTrans = getSearchingStatusTranslation(v);
+                            if (searchingTrans && searchingTrans !== v) {
+                                node.setAttribute(attr, searchingTrans);
+                            }
+                        }
+                    }
+                }
+
+                if (node.shadowRoot) translateNode(node.shadowRoot);
+                for (const child of node.childNodes) translateNode(child, true);
+
+            } else if (node.nodeType === Node.TEXT_NODE) {
+                let originalVal = node.nodeValue;
+                if (!originalVal || originalVal.trim().length < 1) return;
+                if (translatedValues.get(node) === originalVal) return;
+                const chromeUiTranslation = getChromeUiTranslation(node, originalVal);
+                if (chromeUiTranslation) {
+                    replaceTextNode(node, chromeUiTranslation);
+                    return;
+                }
+                const contextMenuTranslation = getContextMenuTranslation(node, originalVal);
+                if (contextMenuTranslation) {
+                    replaceTextNode(node, contextMenuTranslation);
+                    return;
+                }
+                if (isReasoningBodyNode(node)) return;
+
+                if (originalVal.toLowerCase().includes('pack.info')) {
+                    const parent = node.parentElement;
+                    if (parent) {
+                        if (parent.getAttribute('translate') !== 'no') {
+                            parent.setAttribute('translate', 'no');
+                        }
+                        try {
+                            if (!parent.classList.contains('notranslate')) {
+                                parent.classList.add('notranslate');
+                            }
+                        } catch (e) {}
+                    }
+                    return;
+                }
+
+                if (isInBlockedZone(node)) {
+                    const protectedProductUiTranslation = getProtectedProductUiTranslation(node, originalVal);
+                    if (protectedProductUiTranslation) {
+                        replaceTextNode(node, protectedProductUiTranslation);
+                    }
+                    return;
+                }
+
+                if (translateSkillPickerNameTextNode(node, originalVal)) return;
+                if (translateCommitSummaryTextNode(node, originalVal)) return;
+                if (!parentContainersScanned && translateSpecialContainers(node.parentElement)) return;
+                if (translateCombinedTextChildren(node.parentElement)) return;
+
+                let newVal = originalVal;
+                const hasRecommended = /^\\(Recommended\\)(?:\\s+|$)/i.test(newVal);
+                if (hasRecommended) {
+                    newVal = newVal.replace(/^\\(Recommended\\)(?:\\s+|$)/i, '');
+                }
+                const valNorm = norm(newVal);
+                const valLower = valNorm.toLowerCase();
+
+                const shortcutTrans = translateWithShortcut(valNorm);
+                const versionControlUiTrans = getVersionControlUiTranslation(valNorm);
+                const fragmentedStatusTrans = translateFragmentedStatus(node, originalVal);
+                const questionnaireOptionTrans = translateQuestionnaireOptionLabel(node, valNorm);
+                const timestampNowTrans = getTimestampNowTranslation(node, valNorm);
+                const recentProjectSectionTrans = getRecentProjectSectionTranslation(node, valNorm);
+                const deleteTaskConfirmationTrans = getDeleteTaskConfirmationTranslation(node, valNorm);
+                const exploredTrans = translateExploredStatus(valNorm);
+                const baselineQuotaRefreshTrans = getBaselineQuotaRefreshTranslation(valNorm);
+                const subagentStatusTrans = getDynamicSubagentStatusTranslation(valNorm);
+                const bracketedTaskStatusTrans = getBracketedTaskStatusTranslation(valNorm);
+                const productUiTrans = getDynamicProductUiTranslation(valNorm);
+                const projectDeleteSummaryTrans = getProjectDeleteSummaryTranslation(valNorm);
+                const customizationBudgetTrans = getCustomizationBudgetTranslation(valNorm);
+                const artifactFileCountTrans = getArtifactFileCountTranslation(valNorm);
+                const commandInputStatusTrans = getCommandInputStatusTranslation(valNorm);
+                const relativeTimeTrans = getRelativeTimeTranslation(valNorm);
+                const workingStatusTrans = getWorkingStatusTranslation(valNorm);
+                const searchingStatusTrans = getSearchingStatusTranslation(valNorm);
+                const compactCountLabelTrans = getCompactCountLabelTranslation(valNorm);
+                const artifactTimestampTrans = getArtifactTimestampTranslation(valNorm);
+                const quotaNoticeTrans = getQuotaNoticeTranslation(valNorm);
+                const archivedConversationNoticeTrans = getArchivedConversationNoticeTranslation(valNorm);
+                if (fragmentedStatusTrans !== null) {
+                    newVal = fragmentedStatusTrans;
+                } else if (questionnaireOptionTrans) {
+                    newVal = questionnaireOptionTrans;
+                } else if (timestampNowTrans) {
+                    newVal = timestampNowTrans;
+                } else if (recentProjectSectionTrans) {
+                    newVal = recentProjectSectionTrans;
+                } else if (deleteTaskConfirmationTrans) {
+                    newVal = deleteTaskConfirmationTrans;
+                } else if (shortcutTrans) {
+                    newVal = shortcutTrans;
+                } else if (versionControlUiTrans) {
+                    newVal = versionControlUiTrans;
+                } else if (exploredTrans) {
+                    newVal = exploredTrans;
+                } else if (baselineQuotaRefreshTrans) {
+                    newVal = baselineQuotaRefreshTrans;
+                } else if (subagentStatusTrans) {
+                    newVal = subagentStatusTrans;
+                } else if (bracketedTaskStatusTrans) {
+                    newVal = bracketedTaskStatusTrans;
+                } else if (productUiTrans) {
+                    newVal = productUiTrans;
+                } else if (projectDeleteSummaryTrans) {
+                    newVal = projectDeleteSummaryTrans;
+                } else if (customizationBudgetTrans) {
+                    newVal = customizationBudgetTrans;
+                } else if (artifactFileCountTrans) {
+                    newVal = artifactFileCountTrans;
+                } else if (commandInputStatusTrans) {
+                    newVal = commandInputStatusTrans;
+                } else if (relativeTimeTrans) {
+                    newVal = relativeTimeTrans;
+                } else if (workingStatusTrans) {
+                    newVal = workingStatusTrans;
+                } else if (searchingStatusTrans) {
+                    newVal = searchingStatusTrans;
+                } else if (compactCountLabelTrans) {
+                    newVal = compactCountLabelTrans;
+                } else if (artifactTimestampTrans) {
+                    newVal = artifactTimestampTrans;
+                } else if (quotaNoticeTrans) {
+                    newVal = quotaNoticeTrans;
+                } else if (archivedConversationNoticeTrans) {
+                    newVal = archivedConversationNoticeTrans;
+                } else if (map.has(valNorm)) {
+                    newVal = map.get(valNorm);
+                    if ((valNorm === 'Modified in' || valNorm === 'Also modified in') && /\\s$/.test(originalVal)) {
+                        newVal += ' ';
+                    }
+                } else if (/^(?:Also\\s+modified|Modified)\\s+in\\s+(\\d+)\\s*(?:projects?|个?项目)$/i.test(valNorm)) {
+                    const isAlso = /^Also/i.test(valNorm);
+                    newVal = valNorm.replace(/^(?:Also\\s+modified|Modified)\\s+in\\s+(\\d+)\\s*(?:projects?|个?项目)$/i, (m, count) => (isAlso ? "也修改于 " : "修改于 ") + count + " 个项目");
+                } else if (/^(?:Also\\s+modified|Modified)\\s+in\\s+(.+)$/i.test(valNorm)) {
+                    const isAlso = /^Also/i.test(valNorm);
+                    newVal = valNorm.replace(/^(?:Also\\s+modified|Modified)\\s+in\\s+(.+)$/i, (m, target) => {
+                        const targetNorm = norm(target);
+                        let translatedTarget = target;
+                        if (/^untitled\\s+project$/i.test(targetNorm)) {
+                            translatedTarget = "无标题项目";
+                        } else if (/^outside\\s+of\\s+project$/i.test(targetNorm)) {
+                            translatedTarget = "项目外部";
+                        }
+                        return (isAlso ? "也修改于 " : "修改于 ") + translatedTarget;
+                    });
+                } else if (/^Gemini\\s+(.+?)\\s+is now available$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Gemini\\s+(.+?)\\s+is now available$/i, (m, model) => "Gemini " + model + " 现已可用");
+                } else if (lowerMap.has(valLower)) {
+                    newVal = lowerMap.get(valLower);
+                } else if (/^Refreshes in (\\d+) days?, (\\d+) hours?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Refreshes in (\\d+) days?, (\\d+) hours?$/i, (match, d, h) => {
+                        return d + " 天 " + h + " 小时后刷新";
+                    });
+                } else if (/^Refreshes in (\\d+) hours?, (\\d+) minutes?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Refreshes in (\\d+) hours?, (\\d+) minutes?$/i, (match, h, m) => {
+                        return h + " 小时 " + m + " 分钟后刷新";
+                    });
+                } else if (/^Refreshes in (\\d+) days?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Refreshes in (\\d+) days?$/i, (match, d) => {
+                        return d + " 天后刷新";
+                    });
+                } else if (/^Refreshes in (\\d+) hours?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Refreshes in (\\d+) hours?$/i, (match, h) => {
+                        return h + " 小时后刷新";
+                    });
+                } else if (/^Refreshes in (\\d+) minutes?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Refreshes in (\\d+) minutes?$/i, (match, m) => {
+                        return m + " 分钟后刷新";
+                    });
+                } else if (/^Resets in <1m$/i.test(valNorm)) {
+                    newVal = "不足 1 分钟后重置";
+                } else if (/^Resets in (?:(\\d+)\\s*(?:d|days?))?\\s*,?\\s*(?:(\\d+)\\s*(?:h|hours?))?\\s*,?\\s*(?:(\\d+)\\s*(?:m|mins?|minutes?))?\\s*,?\\s*(?:(\\d+)\\s*(?:s|secs?|seconds?))?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Resets in (?:(\\d+)\\s*(?:d|days?))?\\s*,?\\s*(?:(\\d+)\\s*(?:h|hours?))?\\s*,?\\s*(?:(\\d+)\\s*(?:m|mins?|minutes?))?\\s*,?\\s*(?:(\\d+)\\s*(?:s|secs?|seconds?))?$/i, (match, d, h, m, s) => {
+                        let parts = [];
+                        if (d) parts.push(d + " 天");
+                        if (h) parts.push(h + " 小时");
+                        if (m) parts.push(m + " 分钟");
+                        if (s) parts.push(s + " 秒");
+                        return parts.length ? parts.join(" ") + "后重置" : match;
+                    });
+                } else if (/^You have used some of your weekly limit, it will fully refresh in (\\d+) days?, (\\d+) hours?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have used some of your weekly limit, it will fully refresh in (\\d+) days?, (\\d+) hours?\\.$/i, (match, d, h) => {
+                        return "您已使用部分每周配额，将在 " + d + " 天 " + h + " 小时后完全刷新";
+                    });
+                } else if (/^You have used some of your weekly limit, it will fully refresh in (\\d+) hours?, (\\d+) minutes?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have used some of your weekly limit, it will fully refresh in (\\d+) hours?, (\\d+) minutes?\\.$/i, (match, h, m) => {
+                        return "您已使用部分每周配额，将在 " + h + " 小时 " + m + " 分钟后完全刷新";
+                    });
+                } else if (/^You have used some of your weekly limit, it will fully refresh in (\\d+) days?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have used some of your weekly limit, it will fully refresh in (\\d+) days?\\.$/i, (match, d) => {
+                        return "您已使用部分每周配额，将在 " + d + " 天后完全刷新";
+                    });
+                } else if (/^You have used some of your weekly limit, it will fully refresh in (\\d+) hours?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have used some of your weekly limit, it will fully refresh in (\\d+) hours?\\.$/i, (match, h) => {
+                        return "您已使用部分每周配额，将在 " + h + " 小时后完全刷新";
+                    });
+                } else if (/^You have used some of your weekly limit, it will fully refresh in (\\d+) minutes?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have used some of your weekly limit, it will fully refresh in (\\d+) minutes?\\.$/i, (match, m) => {
+                        return "您已使用部分每周配额，将在 " + m + " 分钟后完全刷新";
+                    });
+                } else if (/^You have used some of your weekly limit, it will fully refresh in less than a minute\\.$/i.test(valNorm)) {
+                    newVal = "您已使用部分每周配额，将在不到 1 分钟后完全刷新";
+                } else if (/^You have used some of your 5-hour limit, it will fully refresh in (\\d+) hours?, (\\d+) minutes?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have used some of your 5-hour limit, it will fully refresh in (\\d+) hours?, (\\d+) minutes?\\.$/i, (match, h, m) => {
+                        return "您已使用部分 5 小时配额，将在 " + h + " 小时 " + m + " 分钟后完全刷新";
+                    });
+                } else if (/^You have used some of your 5-hour limit, it will fully refresh in (\\d+) hours?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have used some of your 5-hour limit, it will fully refresh in (\\d+) hours?\\.$/i, (match, h) => {
+                        return "您已使用部分 5 小时配额，将在 " + h + " 小时后完全刷新";
+                    });
+                } else if (/^You have used some of your 5-hour limit, it will fully refresh in (\\d+) minutes?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have used some of your 5-hour limit, it will fully refresh in (\\d+) minutes?\\.$/i, (match, m) => {
+                        return "您已使用部分 5 小时配额，将在 " + m + " 分钟后完全刷新";
+                    });
+                } else if (/^You have used some of your 5-hour limit, it will fully refresh in less than a minute\\.$/i.test(valNorm)) {
+                    newVal = "您已使用部分 5 小时配额，将在不到 1 分钟后完全刷新";
+                } else if (/^Your 5-hour limit will refresh in (\\d+) days?, (\\d+) hours?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Your 5-hour limit will refresh in (\\d+) days?, (\\d+) hours?\\.$/i, (match, d, h) => {
+                        return "您的 5 小时配额将在 " + d + " 天 " + h + " 小时后刷新";
+                    });
+                } else if (/^Your 5-hour limit will refresh in (\\d+) hours?, (\\d+) minutes?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Your 5-hour limit will refresh in (\\d+) hours?, (\\d+) minutes?\\.$/i, (match, h, m) => {
+                        return "您的 5 小时配额将在 " + h + " 小时 " + m + " 分钟后刷新";
+                    });
+                } else if (/^Your 5-hour limit will refresh in (\\d+) days?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Your 5-hour limit will refresh in (\\d+) days?\\.$/i, (match, d) => {
+                        return "您的 5 小时配额将在 " + d + " 天后刷新";
+                    });
+                } else if (/^Your 5-hour limit will refresh in (\\d+) hours?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Your 5-hour limit will refresh in (\\d+) hours?\\.$/i, (match, h) => {
+                        return "您的 5 小时配额将在 " + h + " 小时后刷新";
+                    });
+                } else if (/^Your 5-hour limit will refresh in (\\d+) minutes?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Your 5-hour limit will refresh in (\\d+) minutes?\\.$/i, (match, m) => {
+                        return "您的 5 小时配额将在 " + m + " 分钟后刷新";
+                    });
+                } else if (/^Your 5-hour limit will refresh in less than a minute\\.$/i.test(valNorm)) {
+                    newVal = "您的 5 小时配额将在不到 1 分钟后刷新";
+                } else if (/^You have hit your 5-hour limit, it will refresh in (\\d+) days?, (\\d+) hours?\\. If on a supported paid plan, you can use AI credits in the interim\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have hit your 5-hour limit, it will refresh in (\\d+) days?, (\\d+) hours?\\. If on a supported paid plan, you can use AI credits in the interim\\.$/i, (match, d, h) => {
+                        return "您已达到 5 小时配额限制，将在 " + d + " 天 " + h + " 小时后刷新。如果使用的是受支持的付费计划，您可以在此期间使用 AI 额度";
+                    });
+                } else if (/^You have hit your 5-hour limit, it will refresh in (\\d+) hours?, (\\d+) minutes?\\. If on a supported paid plan, you can use AI credits in the interim\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have hit your 5-hour limit, it will refresh in (\\d+) hours?, (\\d+) minutes?\\. If on a supported paid plan, you can use AI credits in the interim\\.$/i, (match, h, m) => {
+                        return "您已达到 5 小时配额限制，将在 " + h + " 小时 " + m + " 分钟后刷新。如果使用的是受支持的付费计划，您可以在此期间使用 AI 额度";
+                    });
+                } else if (/^Error ID:\\s*(.+)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Error ID:\\s*(.+)$/i, (match, id) => {
+                        return "错误 ID: " + id;
+                    });
+                } else if (/^Models within this group:\\s*(.+)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Models within this group:\\s*(.+)$/i, (match, models) => {
+                        return "此组内的模型: " + models;
+                    });
+                } else if (/^Executor is not currently running \\(error ID:\\s*(.+)\\)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Executor is not currently running \\(error ID:\\s*(.+)\\)$/i, (match, id) => {
+                        return "执行器当前未运行 (错误 ID: " + id + ")";
+                    });
+                } else if (/^(?:Thinking for|Thought for|Worked for|Stopped after)\\s+([\\d\\w\\s,.]+?)(?:\\s*(>))?$/i.test(valNorm)) {
+                    const durationMatch = valNorm.match(/^(Thinking for|Thought for|Worked for|Stopped after)\\s+([\\d\\w\\s,.]+?)(?:\\s*(>))?$/i);
+                    if (durationMatch) {
+                        const action = durationMatch[1].toLowerCase();
+                        const arrow = durationMatch[3] ? " >" : "";
+                        let actionStr = "작업 시간: ";
+                        if (action === "thinking for") actionStr = "생각 중: ";
+                        else if (action === "thought for") actionStr = "생각한 시간: ";
+                        else if (action === "stopped after") actionStr = "중지까지 걸린 시간: ";
+
+                        let durationStr = durationMatch[2]
+                            .replace(/(\\d+)\\s*d(?:ays?)?/gi, "$1일 ")
+                            .replace(/(\\d+)\\s*h(?:ours?)?/gi, "$1시간 ")
+                            .replace(/([\\d\\.]+)\\s*ms/gi, "$1밀리초 ")
+                            .replace(/(\\d+)\\s*m(?:in(?:ute)?s?)?(?![a-z])/gi, "$1분 ")
+                            .replace(/([\\d\\.]+)\\s*s(?:ec(?:ond)?s?)?/gi, "$1초 ")
+                            .replace(/,/g, "")
+                            .replace(/\\s+/g, " ")
+                            .trim();
+
+                        newVal = actionStr + durationStr + arrow;
+                    }
+                } else if (/^You have hit your 5-hour limit, it will refresh in (\\d+) days?\\. If on a supported paid plan, you can use AI credits in the interim\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have hit your 5-hour limit, it will refresh in (\\d+) days?\\. If on a supported paid plan, you can use AI credits in the interim\\.$/i, (match, d) => {
+                        return "您已达到 5 小时配额限制，将在 " + d + " 天后刷新。如果使用的是受支持的付费计划，您可以在此期间使用 AI 额度";
+                    });
+                } else if (/^You have hit your 5-hour limit, it will refresh in (\\d+) hours?\\. If on a supported paid plan, you can use AI credits in the interim\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have hit your 5-hour limit, it will refresh in (\\d+) hours?\\. If on a supported paid plan, you can use AI credits in the interim\\.$/i, (match, h) => {
+                        return "您已达到 5 小时配额限制，将在 " + h + " 小时后刷新。如果使用的是受支持的付费计划，您可以在此期间使用 AI 额度";
+                    });
+                } else if (/^You have hit your 5-hour limit, it will refresh in (\\d+) minutes?\\. If on a supported paid plan, you can use AI credits in the interim\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have hit your 5-hour limit, it will refresh in (\\d+) minutes?\\. If on a supported paid plan, you can use AI credits in the interim\\.$/i, (match, m) => {
+                        return "您已达到 5 小时配额限制，将在 " + m + " 分钟后刷新。如果使用的是受支持的付费计划，您可以在此期间使用 AI 额度";
+                    });
+                } else if (/^You have hit your 5-hour limit, it will refresh in less than a minute\\. If on a supported paid plan, you can use AI credits in the interim\\.$/i.test(valNorm)) {
+                    newVal = "您已达到 5 小时配额限制，将在不到 1 分钟后刷新。如果使用的是受支持的付费计划，您可以在此期间使用 AI 额度";
+                } else if (/^You have hit your weekly limit, it will fully refresh in (\\d+) days?, (\\d+) hours?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have hit your weekly limit, it will fully refresh in (\\d+) days?, (\\d+) hours?\\.$/i, (match, d, h) => {
+                        return "您已达到每周配额限制，将在 " + d + " 天 " + h + " 小时后完全刷新";
+                    });
+                } else if (/^You have hit your weekly limit, it will fully refresh in (\\d+) hours?, (\\d+) minutes?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have hit your weekly limit, it will fully refresh in (\\d+) hours?, (\\d+) minutes?\\.$/i, (match, h, m) => {
+                        return "您已达到每周配额限制，将在 " + h + " 小时 " + m + " 分钟后完全刷新";
+                    });
+                } else if (/^You have hit your weekly limit, it will fully refresh in (\\d+) days?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have hit your weekly limit, it will fully refresh in (\\d+) days?\\.$/i, (match, d) => {
+                        return "您已达到每周配额限制，将在 " + d + " 天后完全刷新";
+                    });
+                } else if (/^You have hit your weekly limit, it will fully refresh in (\\d+) hours?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have hit your weekly limit, it will fully refresh in (\\d+) hours?\\.$/i, (match, h) => {
+                        return "您已达到每周配额限制，将在 " + h + " 小时后完全刷新";
+                    });
+                } else if (/^You have hit your weekly limit, it will fully refresh in (\\d+) minutes?\\.$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^You have hit your weekly limit, it will fully refresh in (\\d+) minutes?\\.$/i, (match, m) => {
+                        return "您已达到每周配额限制，将在 " + m + " 分钟后完全刷新";
+                    });
+                } else if (/^You have hit your weekly limit, it will fully refresh in less than a minute\\.$/i.test(valNorm)) {
+                    newVal = "您已达到每周配额限制，将在不到 1 分钟后完全刷新";
+                } else if (/^Match case \\((.+)\\)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Match case \\((.+)\\)$/i, (m, k) => "区分大小写 (" + k + ")");
+                } else if (/^Match whole word \\((.+)\\)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Match whole word \\((.+)\\)$/i, (m, k) => "全字匹配 (" + k + ")");
+                } else if (/^Use regular expression \\((.+)\\)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Use regular expression \\((.+)\\)$/i, (m, k) => "使用正则表达式 (" + k + ")");
+                } else if (/^Previous match \\((.+)\\)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Previous match \\((.+)\\)$/i, (m, k) => "上一个匹配项 (" + k + ")");
+                } else if (/^Next match \\((.+)\\)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Next match \\((.+)\\)$/i, (m, k) => "下一个匹配项 (" + k + ")");
+                } else if (/^Close \\((.+)\\)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Close \\((.+)\\)$/i, (m, k) => "关闭 (" + k + ")");
+                } else if (/^Learn more about (.+)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Learn more about (.+)$/i, (match, p) => {
+                        let translatedPreset = p;
+                        if (p.toLowerCase() === 'default') translatedPreset = "默认 (Default)";
+                        else if (p.toLowerCase() === 'full machine') translatedPreset = "全机访问 (Full Machine)";
+                        else if (p.toLowerCase() === 'turbo mode') translatedPreset = "极速模式 (Turbo Mode)";
+                        else if (p.toLowerCase() === 'custom') translatedPreset = "自定义 (Custom)";
+                        return "了解更多关于 " + translatedPreset + " 的信息";
+                    });
+                } else if (/^(\\d+) tools? enabled$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^(\\d+) tools? enabled$/i, (match, num) => {
+                        return num + " 个工具已启用";
+                    });
+                } else if (/^(\\d+) active conversations?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^(\\d+) active conversations?$/i, (match, num) => {
+                        return num + " 个活跃会话";
+                    });
+                } else if (/^(\\d+) archived conversations?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^(\\d+) archived conversations?$/i, (match, num) => {
+                        return num + " 个已归档会话";
+                    });
+                } else if (/^(\\d+) tasks? running$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^(\\d+) tasks? running$/i, (match, num) => {
+                        return num + " 个任务正在运行";
+                    });
+                } else if (/^(\\d+) files? changed$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^(\\d+) files? changed$/i, (match, num) => {
+                        return num + " 个文件已更改";
+                    });
+                } else if (/^Show (\\d+) more(\\.\\.\\.|…)?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Show (\\d+) more(\\.\\.\\.|…)?$/i, (match, num) => {
+                        return "显示另外 " + num + " 个...";
+                    });
+                } else if (/^Show (\\d+) breakdowns?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Show (\\d+) breakdowns?$/i, (match, num) => {
+                        return "显示 " + num + " 项明细";
+                    });
+                } else if (/^See all \\((\\d+)\\)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^See all \\((\\d+)\\)$/i, (match, num) => {
+                        return "显示全部 (" + num + ")";
+                    });
+                } else if (/^Available AI Credits: (\\d+)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Available AI Credits: (\\d+)$/i, (match, num) => {
+                        return "可用 AI 额度: " + num;
+                    });
+                } else if (/^Send feedback as\\s+(.+)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Send feedback as\\s+(.+)$/i, (match, email) => {
+                        return "发送反馈身份为 " + email;
+                    });
+                } else if (/^Media\\s*\\((.+)\\)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Media\\s*\\((.+)\\)$/i, (match, timeStr) => {
+                        let t = timeStr.replace(/Today/i, '今天').replace(/Yesterday/i, '昨天');
+                        return "媒体 (" + t + ")";
+                    });
+                } else if (/^Updated\\s+(.+)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Updated\\s+(.+)$/i, (match, rest) => {
+                        return "更新于 " + rest;
+                    });
+                } else if (/^All scheduled tasks run (?:as|with the)\\s+(.+?)(?:\\s+model)?[\\.\\s]*$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^All scheduled tasks run (?:as|with the)\\s+(.+?)(?:\\s+model)?[\\.\\s]*$/i, (match, model) => {
+                        return "所有计划任务均以 " + model + " 模型运行";
+                    });
+                } else if (/^Individual quota reached\\. Please upgrade your subscription to increase your limits\\. Resets in (.+?)\\.?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Individual quota reached\\. Please upgrade your subscription to increase your limits\\. Resets in (.+?)\\.?$/i, (match, t) => {
+                        return "个人配额已达上限。请升级订阅以提高限额。将于 " + t + " 后重置";
+                    });
+                } else if (/^Mark\\s+(\\d+)\\s+conversations?\\s+as\\s+read$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Mark\\s+(\\d+)\\s+conversations?\\s+as\\s+read$/i, (match, num) => {
+                        return "将 " + num + " 个会话标记为已读";
+                    });
+                } else if (/^Mark\\s+(\\d+)\\s+conversations?\\s+as\\s+unread$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Mark\\s+(\\d+)\\s+conversations?\\s+as\\s+unread$/i, (match, num) => {
+                        return "将 " + num + " 个会话标记为未读";
+                    });
+                } else if (/^Mark\\s+all\\s+(?:conversations?\\s+)?as\\s+read$/i.test(valNorm)) {
+                    newVal = "将所有会话标记为已读";
+                } else if (/^Mark\\s+all\\s+(?:conversations?\\s+)?as\\s+unread$/i.test(valNorm)) {
+                    newVal = "将所有会话标记为未读";
+                } else if (/^Version\\s+([\\d\\.]+)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Version\\s+([\\d\\.]+)$/i, (match, v) => {
+                        return "版本 " + v;
+                    });
+                } else if (/^(\\d+)\\s+subagents?\\s+(running|blocked|completed|failed)$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^(\\d+)\\s+subagents?\\s+(running|blocked|completed|failed)$/i, (match, num, state) => {
+                        const stateLower = state.toLowerCase();
+                        let stateStr = "";
+                        if (stateLower === "running") stateStr = "正在运行";
+                        else if (stateLower === "blocked") stateStr = "已阻塞";
+                        else if (stateLower === "completed") stateStr = "已完成";
+                        else if (stateLower === "failed") stateStr = "已失败";
+                        return num + " 个子智能体" + stateStr;
+                    });
+                } else if (/^(\\d+)\\s+questions?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^(\\d+)\\s+questions?$/i, (match, num) => {
+                        return num + " 个问题";
+                    });
+                } else if (/^Asking\\s+(\\d+)\\s+questions?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Asking\\s+(\\d+)\\s+questions?$/i, (match, num) => {
+                        return "正在询问 " + num + " 个问题";
+                    });
+                } else if (/^View\\s+(\\d+)\\s+side\\s+questions?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^View\\s+(\\d+)\\s+side\\s+questions?$/i, (match, num) => {
+                        return "查看 " + num + " 个侧边提问";
+                    });
+                } else if (/^Asked\\s+(\\d+)\\s+questions?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Asked\\s+(\\d+)\\s+questions?$/i, (match, num) => {
+                        return "已询问 " + num + " 个问题";
+                    });
+                } else if (/^This will permanently delete (\\d+) active (?:conversations?|chats?)(?: and (\\d+) archived (?:conversations?|chats?))? within it\\.?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^This will permanently delete (\\d+) active (?:conversations?|chats?)(?: and (\\d+) archived (?:conversations?|chats?))? within it\\.?$/i, (match, active, archived) => {
+                        if (archived) {
+                            return "这将永久删除 " + active + " 个活跃会话及 " + archived + " 个已归档会话";
+                        }
+                        return "这将永久删除 " + active + " 个活跃会话";
+                    });
+                } else if (/^This will permanently delete (\\d+) archived (?:conversations?|chats?)\\s+within it\\.?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^This will permanently delete (\\d+) archived (?:conversations?|chats?)\\s+within it\\.?$/i, (match, archived) => {
+                        return "这将永久删除 " + archived + " 个已归档会话";
+                    });
+                } else if (/^This will archive (\\d+) active (?:conversations?|chats?)(?: and (\\d+) archived (?:conversations?|chats?))? within it\\.?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^This will archive (\\d+) active (?:conversations?|chats?)(?: and (\\d+) archived (?:conversations?|chats?))? within it\\.?$/i, (match, active, archived) => {
+                        if (archived) {
+                            return "这将归档其中的 " + active + " 个活跃会话及 " + archived + " 个已归档会话";
+                        }
+                        return "这将归档其中的 " + active + " 个活跃会话";
+                    });
+                } else if (/^This will archive (\\d+)\\s*(?:active )?(?:conversations?|chats?|会话s?|个会话)(?: within it)?\\.?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^This will archive (\\d+)\\s*(?:active )?(?:conversations?|chats?|会话s?|个会话)(?: within it)?\\.?$/i, (match, count) => {
+                        return "这将归档其中的 " + count + " 个会话";
+                    });
+                } else if (/^(?:active (?:conversations?|chats?)|个活跃会话)\\s+within it[.。]?$/i.test(valNorm)) {
+                    newVal = " 个活跃会话";
+                } else if (/^(?:archived (?:conversations?|chats?)|个已归档会话)\\s+within it[.。]?$/i.test(valNorm)) {
+                    newVal = " 个已归档会话";
+                } else if (/^(?:conversations?|chats?|会话s?|个会话)\\s+within it[.。]?$/i.test(valNorm)) {
+                    newVal = " 个会话";
+                } else if (/^within it[.。]?$/i.test(valNorm)) {
+                    const parentText = node && node.parentElement ? (node.parentElement.textContent || '') : '';
+                    if (/(?:This will permanently delete|这将永久删除|This will archive|这将归档)/i.test(parentText)) {
+                        newVal = '';
+                    }
+                } else if (/^This will archive$/i.test(valNorm)) {
+                    newVal = "这将归档其中的 ";
+                } else if (/^to be installed\\.?$/i.test(valNorm)) {
+                    const parentText = node && node.parentElement ? (node.parentElement.textContent || '') : '';
+                    if (/(?:browser subagent|浏览器子智能体|Google Chrome)/i.test(parentText)) {
+                        newVal = '。';
+                    }
+                } else if (/^to be installed\\.\\s*(.+)$/i.test(valNorm)) {
+                    const parentText = node && node.parentElement ? (node.parentElement.textContent || '') : '';
+                    if (/(?:browser subagent|浏览器子智能体|Google Chrome)/i.test(parentText)) {
+                        const match = valNorm.match(/^to be installed\\.\\s*(.+)$/i);
+                        const rest = match[1];
+                        const restTrans = map.get(norm(rest)) || lowerMap.get(norm(rest).toLowerCase()) || rest;
+                        newVal = '。' + restTrans;
+                    }
+                } else if (/^(.+?): context deadline exceeded$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^(.+?): context deadline exceeded$/i, (match, prefix) => {
+                        return prefix + ": 请求超时 (context deadline exceeded)";
+                    });
+                } else if (/^(.+?): i\\/o timeout$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^(.+?): i\\/o timeout$/i, (match, prefix) => {
+                        return prefix + ": I/O 超时 (i/o timeout)";
+                    });
+                } else if (/^Are you sure you want to delete (the |this )?project (.+?)\\??$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Are you sure you want to delete (the |this )?project (.+?)\\??$/i, (match, article, name) => {
+                        return "您确定要删除项目 " + name + " 吗？";
+                    });
+                } else if (/^Permanently delete (.+?) including (\\d+) active conversations? and (\\d+) archived conversations?\\.?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^Permanently delete (.+?) including (\\d+) active conversations? and (\\d+) archived conversations?\\.?$/i, (match, name, active, archived) => {
+                        return "永久删除 " + name + "，包含 " + active + " 个活跃会话及 " + archived + " 个已归档会话";
+                    });
+                } else if (/^This will permanently delete (.+?) including (\\d+) active conversations? and (\\d+) archived conversations?(?:\\. This action cannot be undone\\.)?$/i.test(valNorm)) {
+                    newVal = valNorm.replace(/^This will permanently delete (.+?) including (\\d+) active conversations? and (\\d+) archived conversations?(?:\\. This action cannot be undone\\.)?$/i, (match, name, active, archived) => {
+                        return "这将永久删除 " + name + "，包含 " + active + " 个活跃会话及 " + archived + " 个已归档会话，此操作无法撤销";
+                    });
+                } else {
+                    if (valNorm.length > 20) {
+                        for (const [key, translated] of longEntries) {
+                            if (key.length > 20 && key.length <= valNorm.length && valNorm.includes(key)) {
+                                newVal = replaceLongDictionaryEntry(newVal, key, translated);
+                            }
+                        }
+                    }
+
+                    newVal = newVal.replace(/Your 5-hour limit will refresh in (\\d+) days?, (\\d+) hours?\\./gi, (match, d, h) => {
+                        return "您的 5 小时配额将在 " + d + " 天 " + h + " 小时后刷新";
+                    });
+                    newVal = newVal.replace(/Your 5-hour limit will refresh in (\\d+) hours?, (\\d+) minutes?\\./gi, (match, h, m) => {
+                        return "您的 5 小时配额将在 " + h + " 小时 " + m + " 分钟后刷新";
+                    });
+                    newVal = newVal.replace(/Your 5-hour limit will refresh in (\\d+) days?\\./gi, (match, d) => {
+                        return "您的 5 小时配额将在 " + d + " 天后刷新";
+                    });
+                    newVal = newVal.replace(/Your 5-hour limit will refresh in (\\d+) hours?\\./gi, (match, h) => {
+                        return "您的 5 小时配额将在 " + h + " 小时后刷新";
+                    });
+                    newVal = newVal.replace(/Your 5-hour limit will refresh in (\\d+) minutes?\\./gi, (match, m) => {
+                        return "您的 5 小时配额将在 " + m + " 分钟后刷新";
+                    });
+                    newVal = newVal.replace(/You have hit your 5-hour limit, it will refresh in (\\d+) days?, (\\d+) hours?\\. If on a supported paid plan, you can use AI credits in the interim\\./gi, (match, d, h) => {
+                        return "您已达到 5 小时配额限制，将在 " + d + " 天 " + h + " 小时后刷新。如果使用的是受支持的付费计划，您可以在此期间使用 AI 额度";
+                    });
+                    newVal = newVal.replace(/You have hit your 5-hour limit, it will refresh in (\\d+) hours?, (\\d+) minutes?\\. If on a supported paid plan, you can use AI credits in the interim\\./gi, (match, h, m) => {
+                        return "您已达到 5 小时配额限制，将在 " + h + " 小时 " + m + " 分钟后刷新。如果使用的是受支持的付费计划，您可以在此期间使用 AI 额度";
+                    });
+                    newVal = newVal.replace(/You have hit your 5-hour limit, it will refresh in (\\d+) days?\\. If on a supported paid plan, you can use AI credits in the interim\\./gi, (match, d) => {
+                        return "您已达到 5 小时配额限制，将在 " + d + " 天后刷新。如果使用的是受支持的付费计划，您可以在此期间使用 AI 额度";
+                    });
+                    newVal = newVal.replace(/You have hit your 5-hour limit, it will refresh in (\\d+) hours?\\. If on a supported paid plan, you can use AI credits in the interim\\./gi, (match, h) => {
+                        return "您已达到 5 小时配额限制，将在 " + h + " 小时后刷新。如果使用的是受支持的付费计划，您可以在此期间使用 AI 额度";
+                    });
+                    newVal = newVal.replace(/You have hit your 5-hour limit, it will refresh in (\\d+) minutes?\\. If on a supported paid plan, you can use AI credits in the interim\\./gi, (match, m) => {
+                        return "您已达到 5 小时配额限制，将在 " + m + " 分钟后刷新。如果使用的是受支持的付费计划，您可以在此期间使用 AI 额度";
+                    });
+                    newVal = newVal.replace(/You have used some of your weekly limit, it will fully refresh in (\\d+) days?, (\\d+) hours?\\./gi, (match, d, h) => {
+                        return "您已使用部分每周配额，将在 " + d + " 天 " + h + " 小时后完全刷新";
+                    });
+                    newVal = newVal.replace(/You have used some of your weekly limit, it will fully refresh in (\\d+) hours?, (\\d+) minutes?\\./gi, (match, h, m) => {
+                        return "您已使用部分每周配额，将在 " + h + " 小时 " + m + " 分钟后完全刷新";
+                    });
+                    newVal = newVal.replace(/You have used some of your weekly limit, it will fully refresh in (\\d+) days?\\./gi, (match, d) => {
+                        return "您已使用部分每周配额，将在 " + d + " 天后完全刷新";
+                    });
+                    newVal = newVal.replace(/You have used some of your weekly limit, it will fully refresh in (\\d+) hours?\\./gi, (match, h) => {
+                        return "您已使用部分每周配额，将在 " + h + " 小时后完全刷新";
+                    });
+                    newVal = newVal.replace(/You have used some of your weekly limit, it will fully refresh in (\\d+) minutes?\\./gi, (match, m) => {
+                        return "您已使用部分每周配额，将在 " + m + " 分钟后完全刷新";
+                    });
+                    newVal = newVal.replace(/You have hit your weekly limit, it will fully refresh in (\\d+) days?, (\\d+) hours?\\./gi, (match, d, h) => {
+                        return "您已达到每周配额限制，将在 " + d + " 天 " + h + " 小时后完全刷新";
+                    });
+                    newVal = newVal.replace(/You have hit your weekly limit, it will fully refresh in (\\d+) hours?, (\\d+) minutes?\\./gi, (match, h, m) => {
+                        return "您已达到每周配额限制，将在 " + h + " 小时 " + m + " 分钟后完全刷新";
+                    });
+                    newVal = newVal.replace(/You have hit your weekly limit, it will fully refresh in (\\d+) days?\\./gi, (match, d) => {
+                        return "您已达到每周配额限制，将在 " + d + " 天后完全刷新";
+                    });
+                    newVal = newVal.replace(/You have hit your weekly limit, it will fully refresh in (\\d+) hours?\\./gi, (match, h) => {
+                        return "您已达到每周配额限制，将在 " + h + " 小时后完全刷新";
+                    });
+                    newVal = newVal.replace(/You have hit your weekly limit, it will fully refresh in (\\d+) minutes?\\./gi, (match, m) => {
+                        return "您已达到每周配额限制，将在 " + m + " 分钟后完全刷新";
+                    });
+                    newVal = newVal.replace(/You have used some of your weekly limit, it will fully refresh in less than a minute\\./gi, "您已使用部分每周配额，将在不到 1 分钟后完全刷新");
+                    newVal = newVal.replace(/You have hit your weekly limit, it will fully refresh in less than a minute\\./gi, "您已达到每周配额限制，将在不到 1 分钟后完全刷新");
+                    newVal = newVal.replace(/Your 5-hour limit will refresh in less than a minute\\./gi, "您的 5 小时配额将在不到 1 分钟后刷新");
+                    newVal = newVal.replace(/You have hit your 5-hour limit, it will refresh in less than a minute\\. If on a supported paid plan, you can use AI credits in the interim\\./gi, "您已达到 5 小时配额限制，将在不到 1 分钟后刷新。如果使用的是受支持的付费计划，您可以在此期间使用 AI 额度");
+                    newVal = newVal.replace(/Match case \\((.+)\\)/gi, (m, k) => "区分大小写 (" + k + ")");
+                    newVal = newVal.replace(/Match whole word \\((.+)\\)/gi, (m, k) => "全字匹配 (" + k + ")");
+                    newVal = newVal.replace(/Use regular expression \\((.+)\\)/gi, (m, k) => "使用正则表达式 (" + k + ")");
+                    newVal = newVal.replace(/Previous match \\((.+)\\)/gi, (m, k) => "上一个匹配项 (" + k + ")");
+                    newVal = newVal.replace(/Next match \\((.+)\\)/gi, (m, k) => "下一个匹配项 (" + k + ")");
+                    newVal = newVal.replace(/Close \\((.+)\\)/gi, (m, k) => "关闭 (" + k + ")");
+                    const exploredSec3 = translateExploredStatus(newVal);
+                    if (exploredSec3) {
+                        newVal = exploredSec3;
+                    }
+                    newVal = newVal.replace(/^(\\d+)\\s+searches?\\s*>?\\s*$/i, (m, n) => n + " 次搜索");
+                    newVal = newVal.replace(/^searches?\\s*>?\\s*$/i, () => "次搜索");
+                    newVal = newVal.replace(/^files?\\s*>?\\s*$/i, () => "个文件");
+                    newVal = newVal.replace(/^(\\d+)\\s+pages?(\\s*[>›]?)\\s*$/i, (m, n, suffix) => n + " 个页面" + suffix);
+                    newVal = newVal.replace(/^(?:ran|run|executed)\\s+(\\d+)\\s+commands?(\\s*[>›]?)\\s*$/i, (m, n, suffix) => "运行了 " + n + " 条命令" + (suffix || ""));
+                    newVal = newVal.replace(/^(\\d+)\\s+commands?(\\s*[>›]?)\\s*$/i, (m, n, suffix) => n + " 条命令" + (suffix || ""));
+                }
+                // Do not expose Chinese generated by older dynamic helpers.
+                // The product's source string is English in this case, so an
+                // English fallback is more useful than a misleading partial
+                // translation.
+                if (containsHan(newVal) && !containsHan(originalVal)) {
+                    newVal = valNorm;
+                }
+                if (hasRecommended) {
+                    newVal = '（推荐）' + newVal;
+                }
+                if (newVal !== originalVal) {
+                    translatedValues.set(node, newVal);
+                    node.nodeValue = newVal;
+                }
+            }
+        } catch (e) {}
+    }
+
+    const observer = new MutationObserver(mutations => {
+        for (const m of mutations) {
+            if (m.type === 'childList') {
+                for (const n of m.addedNodes) translateNode(n);
+            } else if (m.type === 'characterData') {
+                translateNode(m.target);
+            } else if (m.type === 'attributes') {
+                translateNode(m.target);
+            }
+        }
+    });
+
+    const obsOpts = {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ['placeholder', 'aria-placeholder', 'data-placeholder', 'title', 'aria-label']
+    };
+
+    let engineStarted = false;
+    const startEngine = () => {
+        const target = document.body || document.documentElement;
+        if (!target || engineStarted) return;
+
+        engineStarted = true;
+        try {
+            translateNode(target);
+            observer.observe(target, obsOpts);
+        } catch (e) {}
+    };
+
+    const origAttachShadow = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function() {
+        const sr = origAttachShadow.apply(this, arguments);
+        try { observer.observe(sr, obsOpts); } catch(e) {}
+        return sr;
+    };
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', startEngine);
+    } else {
+        startEngine();
+    }
+    window.addEventListener('load', startEngine);
+})();
+${SIGNATURE_END}`;
+
+    return jsSource.replace("DICT_PLACEHOLDER", dictJson).replace("REPLACEMENT_ENTRIES_PLACEHOLDER", entriesJson);
+}
+
+function removeMarkedBlocks(content, startMark, endMark) {
+    let cleaned = content;
+    let startIdx = cleaned.indexOf(startMark);
+    while (startIdx !== -1) {
+        const endIdx = cleaned.indexOf(endMark, startIdx + startMark.length);
+        if (endIdx === -1) break;
+        cleaned = cleaned.substring(0, startIdx) + cleaned.substring(endIdx + endMark.length);
+        startIdx = cleaned.indexOf(startMark);
+    }
+    return cleaned;
+}
+
+function cleanJsContent(content) {
+    const withoutLegacy = removeMarkedBlocks(content, LEGACY_SIGNATURE_START, LEGACY_SIGNATURE_END);
+    return removeMarkedBlocks(withoutLegacy, SIGNATURE_START, SIGNATURE_END);
+}
+
+function cleanMenuJsContent(content) {
+    const withoutLegacy = removeMarkedBlocks(content, LEGACY_MENU_SIGNATURE_START, LEGACY_MENU_SIGNATURE_END);
+    return removeMarkedBlocks(withoutLegacy, MENU_SIGNATURE_START, MENU_SIGNATURE_END);
+}
+
+function cleanTrayJsContent(content) {
+    const withoutLegacy = removeMarkedBlocks(content, LEGACY_TRAY_SIGNATURE_START, LEGACY_TRAY_SIGNATURE_END);
+    return removeMarkedBlocks(withoutLegacy, TRAY_SIGNATURE_START, TRAY_SIGNATURE_END);
+}
+
+let wasAppRunning = false;
+
+function getPosixTargetUid() {
+    const sudoUidText = String(process.env.SUDO_UID || '');
+    if (/^\d+$/.test(sudoUidText)) return Number(sudoUidText);
+    return typeof process.getuid === 'function' ? process.getuid() : null;
+}
+
+function getPosixProcessTable() {
+    try {
+        const stdout = child_process.execFileSync(
+            'ps',
+            ['-eo', 'pid=,ppid=,uid=,stat=,comm=,args='],
+            { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+        );
+        return stdout.split(/\r?\n/).map(line => {
+            const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)(?:\s+(.*))?$/);
+            if (!match) return null;
+            return {
+                pid: Number(match[1]),
+                ppid: Number(match[2]),
+                uid: Number(match[3]),
+                stat: match[4],
+                comm: match[5],
+                args: match[6] || ''
+            };
+        }).filter(Boolean);
+    } catch (e) {
+        return [];
+    }
+}
+
+function isPosixAntigravityMainProcess(entry, targetUid = getPosixTargetUid()) {
+    if (targetUid !== null && entry.uid !== targetUid) return false;
+    if (/(?:^|\s)--type(?:=|\s)/i.test(entry.args)) return false;
+
+    const commBase = path.basename(entry.comm).toLowerCase();
+    if (commBase === 'antigravity') return true;
+
+    return /^\s*\/.*\/Antigravity\.app\/Contents\/MacOS\/Antigravity(?:\s|$)/i.test(entry.args);
+}
+
+function getPosixAntigravityMainProcesses(processTable = getPosixProcessTable()) {
+    const targetUid = getPosixTargetUid();
+    return processTable.filter(entry => isPosixAntigravityMainProcess(entry, targetUid));
+}
+
+function collectPosixProcessTreePids(processTable, rootPids) {
+    const collected = new Set(rootPids);
+    let changed = true;
+    while (changed) {
+        changed = false;
+        for (const entry of processTable) {
+            if (!collected.has(entry.ppid) || collected.has(entry.pid)) continue;
+            collected.add(entry.pid);
+            changed = true;
+        }
+    }
+    return collected;
+}
+
+function refreshPosixProcessTree(trackedPids) {
+    const processTable = getPosixProcessTable();
+    const expanded = collectPosixProcessTreePids(processTable, trackedPids);
+    for (const pid of expanded) trackedPids.add(pid);
+    return processTable.filter(entry => {
+        return trackedPids.has(entry.pid) && !entry.stat.toUpperCase().startsWith('Z');
+    });
+}
+
+function sleepSync(milliseconds) {
+    const waitArray = new Int32Array(new SharedArrayBuffer(4));
+    Atomics.wait(waitArray, 0, 0, milliseconds);
+}
+
+function signalPosixProcesses(processEntries, signal) {
+    for (const entry of processEntries) {
+        try {
+            process.kill(entry.pid, signal);
+        } catch (e) {
+            if (e.code !== 'ESRCH') {
+                console.warn("[WARNING] Could not send " + signal + " to process " + entry.pid + " (" + entry.comm + "): " + e.message);
+            }
+        }
+    }
+}
+
+function waitForPosixProcessTreeExit(trackedPids, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    let remaining = refreshPosixProcessTree(trackedPids);
+    while (remaining.length > 0 && Date.now() < deadline) {
+        sleepSync(100);
+        remaining = refreshPosixProcessTree(trackedPids);
+    }
+    return remaining;
+}
+
+function checkIfAppIsRunning() {
+    try {
+        if (process.platform === 'win32') {
+            const stdout = child_process.execSync('tasklist /fi "imagename eq Antigravity.exe" /nh', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+            return stdout.toLowerCase().includes('antigravity.exe');
+        } else {
+            const processTable = getPosixProcessTable();
+            if (processTable.length === 0) return true;
+            return getPosixAntigravityMainProcesses(processTable).length > 0;
+        }
+    } catch (e) {
+    }
+    return false;
+}
+
+function closeAntigravityProcesses() {
+    console.log("[1] Antigravity is running. Waiting for it to exit completely...");
+    try {
+        if (process.platform === 'win32') {
+            child_process.execSync('taskkill /f /im Antigravity.exe /t >nul 2>nul');
+            sleepSync(1500);
+            return true;
+        }
+    } catch (e) {
+        console.error("[ERROR] Failed to close Antigravity: " + e.message);
+        return false;
+    }
+
+    const platformLabel = process.platform === 'darwin' ? 'macOS' : 'Linux';
+    const processTable = getPosixProcessTable();
+    if (processTable.length === 0) {
+        console.error(`[ERROR] Could not read the ${platformLabel} process list. Installation stopped to avoid overwriting files in use.`);
+        return false;
+    }
+    const mainProcesses = getPosixAntigravityMainProcesses(processTable);
+    if (mainProcesses.length === 0) return true;
+
+    const trackedPids = collectPosixProcessTreePids(
+        processTable,
+        mainProcesses.map(entry => entry.pid)
+    );
+    const mainPids = new Set(mainProcesses.map(entry => entry.pid));
+
+    signalPosixProcesses(mainProcesses, 'SIGTERM');
+    let remaining = waitForPosixProcessTreeExit(trackedPids, 10000);
+
+    if (remaining.length > 0) {
+        const remainingMainProcesses = remaining.filter(entry => mainPids.has(entry.pid));
+        if (remainingMainProcesses.length > 0) {
+            console.log("[WAIT] The Antigravity main process is still closing. Requesting a normal exit again...");
+            signalPosixProcesses(remainingMainProcesses, 'SIGTERM');
+            remaining = waitForPosixProcessTreeExit(trackedPids, 5000);
+        }
+    }
+
+    if (remaining.length > 0 && !remaining.some(entry => mainPids.has(entry.pid))) {
+        console.log("[WAIT] The main process exited. Closing " + remaining.length + " remaining background processes...");
+        signalPosixProcesses(remaining, 'SIGTERM');
+        remaining = waitForPosixProcessTreeExit(trackedPids, 5000);
+    }
+
+    if (remaining.length > 0) {
+        const summary = remaining
+            .slice(0, 8)
+            .map(entry => entry.pid + " (" + entry.comm + ")")
+            .join(', ');
+        console.error("[ERROR] Antigravity did not exit completely. Installation stopped to protect the running client.");
+        console.error("[ERROR] Still running: " + summary + (remaining.length > 8 ? ' ...' : ''));
+        console.error("[INFO] Close Antigravity and its background tasks, then run the installer again.");
+        return false;
+    }
+
+    console.log("[OK] Antigravity and its background processes have exited.");
+    return true;
+}
+
+function detectInstallationDir(manualDir, options = {}) {
+    const quiet = Boolean(options && options.quiet);
+    const hasAntigravityResources = (candidate) => {
+        return fs.existsSync(path.join(candidate, "resources", "app.asar")) ||
+            fs.existsSync(path.join(candidate, "resources", "app.asar.bak")) ||
+            fs.existsSync(path.join(candidate, "app.asar")) ||
+            fs.existsSync(path.join(candidate, "app.asar.bak")) ||
+            fs.existsSync(path.join(candidate, "Contents", "Resources", "app.asar")) ||
+            fs.existsSync(path.join(candidate, "Contents", "Resources", "app.asar.bak")) ||
+            fs.existsSync(path.join(candidate, "resources", "app", "product.json"));
+    };
+
+    if (manualDir) {
+        if (fs.existsSync(manualDir)) {
+            let resolved = path.resolve(manualDir);
+            if (fs.statSync(resolved).isFile() && resolved.endsWith('app.asar')) {
+                resolved = path.dirname(resolved);
+            }
+            if (!hasAntigravityResources(resolved) && fs.statSync(resolved).isDirectory()) {
+                try {
+                    const subItems = fs.readdirSync(resolved);
+                    for (const sub of subItems) {
+                        const subPath = path.join(resolved, sub);
+                        if (fs.existsSync(subPath) && fs.statSync(subPath).isDirectory() && hasAntigravityResources(subPath)) {
+                            return path.resolve(subPath);
+                        }
+                    }
+                } catch (e) {}
+            }
+            return resolved;
+        } else {
+            if (quiet) return null;
+            console.error(`[ERROR] The specified path does not exist: ${manualDir}`);
+            process.exit(1);
+        }
+    }
+
+    const candidates = [];
+    const seenCandidates = new Set();
+    const addCandidate = (candidate) => {
+        if (!candidate) return;
+        const normalized = path.resolve(candidate);
+        const key = process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+        if (!seenCandidates.has(key)) {
+            candidates.push(normalized);
+            seenCandidates.add(key);
+        }
+    };
+
+    addCandidate(process.env.ANTIGRAVITY_INSTALL_DIR);
+    addCandidate(process.env.ANTIGRAVITY_HOME);
+
+    if (process.platform === 'win32') {
+        const registryRoots = [
+            'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+            'HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+            'HKLM\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall'
+        ];
+        for (const root of registryRoots) {
+            try {
+                const output = child_process.execSync(`reg query "${root}" /s /f Antigravity /d`, { encoding: 'utf-8', stdio: 'pipe' });
+                for (const line of output.split(/\r?\n/)) {
+                    const match = line.match(/^\s*(InstallLocation|DisplayIcon)\s+REG_\w+\s+(.+)$/i);
+                    if (!match) continue;
+                    let value = match[2].trim().replace(/^"|"$/g, '');
+                    if (/Antigravity\.exe/i.test(value)) {
+                        value = path.dirname(value);
+                    }
+                    addCandidate(value);
+                }
+            } catch (e) {
+            }
+        }
+        const driveLetters = ['C', 'D', 'E', 'F'];
+        for (const drive of driveLetters) {
+            addCandidate(`${drive}:\\Programs\\Antigravity`);
+            addCandidate(`${drive}:\\Antigravity`);
+        }
+        addCandidate("C:\\Program Files\\Antigravity");
+        addCandidate("C:\\Program Files (x86)\\Antigravity");
+        const localAppdata = process.env.LOCALAPPDATA;
+        if (localAppdata) {
+            addCandidate(path.join(localAppdata, 'antigravity'));
+            addCandidate(path.join(localAppdata, 'Programs', 'antigravity'));
+        }
+    } else if (process.platform === 'darwin') {
+        const homeDirs = [];
+        if (process.env.HOME) homeDirs.push(process.env.HOME);
+        if (process.env.SUDO_USER && process.env.SUDO_USER !== 'root') {
+            const sudoHome = path.join('/Users', process.env.SUDO_USER);
+            if (fs.existsSync(sudoHome) && !homeDirs.includes(sudoHome)) {
+                homeDirs.push(sudoHome);
+            }
+        }
+        addCandidate('/Applications/Antigravity.app');
+        for (const h of homeDirs) {
+            addCandidate(path.join(h, 'Applications', 'Antigravity.app'));
+        }
+        try {
+            const mdfindOut = child_process.execSync('mdfind "kMDItemFSName == \'Antigravity.app\'" 2>/dev/null', { encoding: 'utf-8' });
+            for (const line of mdfindOut.split(/\r?\n/)) {
+                const trimmed = line.trim();
+                if (trimmed && !trimmed.includes('/.Trash') && !trimmed.includes('/.Trashes') && !trimmed.startsWith('/Volumes/')) {
+                    addCandidate(trimmed);
+                }
+            }
+        } catch (e) {}
+    } else {
+        const homeDirs = [];
+        if (process.env.HOME) homeDirs.push(process.env.HOME);
+        if (process.env.SUDO_USER && process.env.SUDO_USER !== 'root') {
+            let sudoHome = '';
+            try {
+                const getent = child_process.execSync(`getent passwd "${process.env.SUDO_USER}" 2>/dev/null`, { encoding: 'utf-8' }).trim();
+                if (getent) {
+                    const parts = getent.split(':');
+                    if (parts.length >= 6 && parts[5]) {
+                        sudoHome = parts[5];
+                    }
+                }
+            } catch (e) {}
+            if (!sudoHome) {
+                sudoHome = path.join('/home', process.env.SUDO_USER);
+            }
+            if (fs.existsSync(sudoHome) && !homeDirs.includes(sudoHome)) {
+                homeDirs.push(sudoHome);
+            }
+        }
+
+        const isRunningAsRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+
+        const addHomeCandidates = () => {
+            for (const homeDir of homeDirs) {
+                addCandidate(path.join(homeDir, '.local', 'share', 'antigravity'));
+                addCandidate(path.join(homeDir, '.local', 'share', 'Antigravity'));
+                addCandidate(path.join(homeDir, 'antigravity'));
+                addCandidate(path.join(homeDir, 'Antigravity'));
+                addCandidate(path.join(homeDir, '.local', 'share', 'flatpak', 'app', 'com.antigravity', 'current', 'active', 'files', 'share', 'antigravity'));
+            }
+            for (const homeDir of homeDirs) {
+                const userDesktopFiles = [
+                    path.join(homeDir, '.local', 'share', 'applications', 'antigravity.desktop'),
+                    path.join(homeDir, '.local', 'share', 'applications', 'Antigravity.desktop')
+                ];
+                for (const df of userDesktopFiles) {
+                    if (fs.existsSync(df)) {
+                        try {
+                            const content = fs.readFileSync(df, 'utf-8');
+                            const execMatch = content.match(/^Exec=(.*)$/m);
+                            if (execMatch && execMatch[1]) {
+                                let execPath = execMatch[1].trim().split(/\s+/)[0].replace(/^"|"$/g, '');
+                                if (fs.existsSync(execPath)) {
+                                    try { execPath = fs.realpathSync(execPath); } catch (e) {}
+                                    addCandidate(path.dirname(execPath));
+                                }
+                            }
+                        } catch (e) {}
+                    }
+                }
+            }
+        };
+
+        const addSystemCandidates = () => {
+            try {
+                const whichOut = child_process.execSync(
+                    'command -v antigravity 2>/dev/null || which antigravity 2>/dev/null || command -v agy 2>/dev/null || which agy 2>/dev/null || command -v Antigravity 2>/dev/null || which Antigravity 2>/dev/null',
+                    { encoding: 'utf-8' }
+                ).trim();
+                if (whichOut && fs.existsSync(whichOut)) {
+                    let realP = whichOut;
+                    try { realP = fs.realpathSync(whichOut); } catch (e) {}
+                    addCandidate(path.dirname(realP));
+                    try {
+                        const fileContent = fs.readFileSync(realP, 'utf-8');
+                        const scriptMatch = fileContent.match(/(?:\/opt|\/usr|\/home\/[^\s'"]+)\/[^\s'"]*antigravity[^\s'"]*/i);
+                        if (scriptMatch && fs.existsSync(scriptMatch[0])) {
+                            let target = scriptMatch[0];
+                            try { target = fs.realpathSync(target); } catch (e) {}
+                            addCandidate(fs.statSync(target).isDirectory() ? target : path.dirname(target));
+                        }
+                    } catch (e) {}
+                }
+            } catch (e) {}
+
+            const desktopFiles = [
+                '/usr/share/applications/antigravity.desktop',
+                '/usr/share/applications/Antigravity.desktop',
+                '/usr/local/share/applications/antigravity.desktop',
+                '/usr/local/share/applications/Antigravity.desktop'
+            ];
+            for (const df of desktopFiles) {
+                if (fs.existsSync(df)) {
+                    try {
+                        const content = fs.readFileSync(df, 'utf-8');
+                        const execMatch = content.match(/^Exec=(.*)$/m);
+                        if (execMatch && execMatch[1]) {
+                            let execPath = execMatch[1].trim().split(/\s+/)[0].replace(/^"|"$/g, '');
+                            if (fs.existsSync(execPath)) {
+                                try { execPath = fs.realpathSync(execPath); } catch (e) {}
+                                addCandidate(path.dirname(execPath));
+                            }
+                        }
+                    } catch (e) {}
+                }
+            }
+
+            addCandidate('/opt/antigravity/Antigravity-x64');
+            addCandidate('/opt/antigravity/antigravity-x64');
+            addCandidate('/opt/Antigravity/Antigravity-x64');
+            addCandidate('/opt/antigravity');
+            addCandidate('/opt/Antigravity');
+            addCandidate('/usr/local/share/antigravity');
+            addCandidate('/usr/local/share/Antigravity');
+            addCandidate('/usr/share/antigravity');
+            addCandidate('/usr/share/Antigravity');
+            addCandidate('/usr/lib/antigravity');
+            addCandidate('/usr/lib/Antigravity');
+            addCandidate('/snap/antigravity/current');
+            addCandidate('/snap/antigravity/current/usr/share/antigravity');
+            addCandidate('/var/lib/flatpak/app/com.antigravity/current/active/files/share/antigravity');
+        };
+
+        if (isRunningAsRoot) {
+            addSystemCandidates();
+            addHomeCandidates();
+        } else {
+            addHomeCandidates();
+            addSystemCandidates();
+        }
+    }
+
+    for (const p of candidates) {
+        if (fs.existsSync(p)) {
+            if (hasAntigravityResources(p)) {
+                if (!quiet) console.log(`[DETECT] Found the Antigravity installation: ${p}`);
+                return path.resolve(p);
+            }
+            try {
+                if (fs.statSync(p).isDirectory()) {
+                    const subItems = fs.readdirSync(p);
+                    for (const sub of subItems) {
+                        const subPath = path.join(p, sub);
+                        if (fs.existsSync(subPath) && fs.statSync(subPath).isDirectory() && hasAntigravityResources(subPath)) {
+                            if (!quiet) console.log(`[DETECT] Found the Antigravity installation: ${subPath}`);
+                            return path.resolve(subPath);
+                        }
+                    }
+                }
+            } catch (e) {}
+        }
+    }
+
+    if (quiet) return null;
+    console.error("[ERROR] The default installation directory was not found. Use --install-dir to specify it.");
+    process.exit(1);
+}
+
+function runCommandSync(cmd, args) {
+    try {
+        if (Array.isArray(args)) {
+            const res = child_process.spawnSync(cmd, args, { encoding: 'utf-8', stdio: 'pipe' });
+            if (res.error) throw res.error;
+            return {
+                success: res.status === 0,
+                stdout: res.stdout || '',
+                stderr: res.stderr || ''
+            };
+        }
+        const out = child_process.execSync(cmd, { encoding: 'utf-8', stdio: 'pipe' });
+        return { success: true, stdout: out, stderr: '' };
+    } catch (e) {
+        return { success: false, stdout: e.stdout || '', stderr: e.stderr || e.message };
+    }
+}
+
+function reportWritePermissionError(resourcesDir, error, action, entryScript = 'install.sh') {
+    const detail = error && (error.code || error.message);
+    console.error(`\n[PERMISSION ERROR] Could not ${action} the Antigravity installation directory: ${resourcesDir}`);
+    if (detail) console.error(`[DETAIL] ${detail}`);
+
+    if (process.platform === 'win32') {
+        console.error("[INFO] Right-click the installer, choose Run as administrator, and try again.");
+    } else {
+        console.error("[INFO] This installation is in a system directory. Close Antigravity, then run from the localization folder:");
+        console.error(`  sudo ./${entryScript}`);
+    }
+}
+
+function findMacAppBundle(resourcesDir) {
+    if (!resourcesDir) return null;
+    let current = path.resolve(resourcesDir);
+    while (current && current !== path.dirname(current)) {
+        if (current.toLowerCase().endsWith('.app') && fs.existsSync(current)) {
+            return current;
+        }
+        current = path.dirname(current);
+    }
+    return null;
+}
+
+function canWriteAntigravityResources(resourcesDir, entryScript) {
+    const asarPath = path.join(resourcesDir, "app.asar");
+    const bakPath = path.join(resourcesDir, "app.asar.bak");
+    if (!fs.existsSync(asarPath) && !fs.existsSync(bakPath)) return true;
+
+    try {
+        fs.accessSync(resourcesDir, fs.constants.W_OK | fs.constants.X_OK);
+        if (fs.existsSync(asarPath)) {
+            fs.accessSync(asarPath, fs.constants.R_OK | fs.constants.W_OK);
+        }
+        if (fs.existsSync(bakPath)) {
+            fs.accessSync(bakPath, fs.constants.R_OK | fs.constants.W_OK);
+        }
+        if (process.platform === 'darwin') {
+            const targetApp = findMacAppBundle(resourcesDir);
+            if (targetApp) {
+                fs.accessSync(targetApp, fs.constants.W_OK | fs.constants.X_OK);
+            }
+        }
+        return true;
+    } catch (e) {
+        reportWritePermissionError(resourcesDir, e, 'write to', entryScript);
+        return false;
+    }
+}
+
+function resignAppOnMac(resourcesDir) {
+    if (process.platform !== 'darwin') return true;
+
+    let targetApp = findMacAppBundle(resourcesDir);
+    if (!targetApp) {
+        console.warn("[WARNING] Antigravity.app was not recognized. Skipping macOS code signing.");
+        return true;
+    }
+    try {
+        targetApp = fs.realpathSync(targetApp);
+    } catch (e) {}
+
+    console.log(`[SIGN] Clearing macOS quarantine attributes and applying an ad-hoc signature: ${targetApp}`);
+    const xattrRes = runCommandSync('xattr', ['-cr', targetApp]);
+    if (!xattrRes.success) {
+        console.warn(`[WARNING] xattr reported a message while clearing quarantine attributes: ${xattrRes.stderr || xattrRes.stdout}`);
+    }
+
+    // 由内而外（Inside-Out）优先重签内部 Frameworks / Dylibs / Helpers，
+    // 嵌套的 .framework 与 .app 需带上 --deep 确保其内部动态库及辅助程序完成签名，
+    // 避免顶层签名时遗留旧签名导致 dyld 报签名/校验不一致。
+    const frameworksDir = path.join(targetApp, 'Contents', 'Frameworks');
+    if (fs.existsSync(frameworksDir)) {
+        try {
+            const entries = fs.readdirSync(frameworksDir);
+            for (const entry of entries) {
+                const fullPath = path.join(frameworksDir, entry);
+                if (entry.endsWith('.framework') || entry.endsWith('.app')) {
+                    const res = runCommandSync('codesign', ['--force', '--deep', '--sign', '-', fullPath]);
+                    if (!res.success) {
+                        console.warn(`[WARNING] Signing component ${entry} reported a message: ${res.stderr || res.stdout}`);
+                    }
+                } else if (entry.endsWith('.dylib')) {
+                    const res = runCommandSync('codesign', ['--force', '--sign', '-', fullPath]);
+                    if (!res.success) {
+                        console.warn(`[WARNING] Signing library ${entry} reported a message: ${res.stderr || res.stdout}`);
+                    }
+                }
+            }
+        } catch (e) {
+            console.warn(`[WARNING] Could not scan the Frameworks directory: ${e.message}`);
+        }
+    }
+
+    // 注意：绝不能传入 --preserve-metadata=flags,runtime！
+    // 否则会保留 Hardened Runtime（硬化运行时），而硬化运行时默认强制执行 Library Validation（库校验）；
+    // 在本地自签名（ad-hoc，-）缺少 Apple Team ID 的情况下，dyld 会因 Team ID 不一致在启动阶段直接终止进程闪退（SIGABRT）。
+    const signRes = runCommandSync('codesign', [
+        '--force',
+        '--deep',
+        '--sign',
+        '-',
+        targetApp
+    ]);
+    if (!signRes.success) {
+        console.error(`[ERROR] macOS application signing failed.`);
+        console.error(`Details: ${signRes.stderr}\n${signRes.stdout}`);
+        console.error(`[INFO] Make sure Xcode Command Line Tools are installed: xcode-select --install`);
+        return false;
+    }
+
+    console.log(`[OK] macOS ad-hoc signing completed.`);
+    return true;
+}
+
+class AsarArchive {
+    static align4(n) {
+        return (n + 3) & ~3;
+    }
+
+    static readHeader(asarPath) {
+        const fd = fs.openSync(asarPath, 'r');
+        try {
+            const sizeBuf = Buffer.alloc(8);
+            fs.readSync(fd, sizeBuf, 0, 8, 0);
+
+            const headerSize = sizeBuf.readUInt32LE(4);
+            const headerBuf = Buffer.alloc(headerSize);
+            fs.readSync(fd, headerBuf, 0, headerSize, 8);
+
+            const jsonLen = headerBuf.readUInt32LE(4);
+            const jsonStr = headerBuf.slice(8, 8 + jsonLen).toString('utf8');
+            const header = JSON.parse(jsonStr);
+            const baseOffset = 8 + headerSize;
+            return { header, baseOffset, headerSize, jsonLen };
+        } finally {
+            fs.closeSync(fd);
+        }
+    }
+
+    static createHeaderBuffer(headerJson) {
+        const jsonBuf = Buffer.from(headerJson, 'utf8');
+        const jsonLen = jsonBuf.length;
+        const alignedJsonLen = this.align4(jsonLen);
+
+        const headerPayloadSize = 4 + alignedJsonLen;
+        const headerBuf = Buffer.alloc(4 + headerPayloadSize);
+        headerBuf.writeUInt32LE(headerPayloadSize, 0);
+        headerBuf.writeUInt32LE(jsonLen, 4);
+        jsonBuf.copy(headerBuf, 8);
+
+        const sizeBuf = Buffer.alloc(8);
+        sizeBuf.writeUInt32LE(4, 0);
+        sizeBuf.writeUInt32LE(headerBuf.length, 4);
+
+        return Buffer.concat([sizeBuf, headerBuf]);
+    }
+
+    static readFile(sourceAsar, relPath) {
+        const { header, baseOffset } = this.readHeader(sourceAsar);
+        const parts = relPath.replace(/\\/g, '/').split('/');
+        let cur = header.files;
+        for (const p of parts) {
+            if (!cur || !cur[p]) return null;
+            cur = cur[p].files ? cur[p].files : cur[p];
+        }
+        if (cur.unpacked) {
+            const unpackedPath = path.join(`${sourceAsar}.unpacked`, ...parts);
+            if (fs.existsSync(unpackedPath)) return fs.readFileSync(unpackedPath);
+            return null;
+        }
+        if (cur.offset === undefined || cur.size === undefined) return null;
+        const fd = fs.openSync(sourceAsar, 'r');
+        try {
+            const buf = Buffer.alloc(cur.size);
+            fs.readSync(fd, buf, 0, cur.size, baseOffset + parseInt(cur.offset));
+            return buf;
+        } finally {
+            fs.closeSync(fd);
+        }
+    }
+
+    static patchArchive(sourceAsar, targetAsar, filePatches) {
+        const { header, baseOffset } = this.readHeader(sourceAsar);
+        const srcFd = fs.openSync(sourceAsar, 'r');
+        let destFd = null;
+
+        try {
+            const fileEntries = [];
+            function walk(dir, currentPath) {
+                for (const [name, entry] of Object.entries(dir)) {
+                    const fullPath = currentPath ? `${currentPath}/${name}` : name;
+                    if (entry.files) {
+                        walk(entry.files, fullPath);
+                    } else {
+                        fileEntries.push({ path: fullPath, entry });
+                    }
+                }
+            }
+            walk(header.files, '');
+
+            const packedFiles = fileEntries.filter(f => !f.entry.unpacked && f.entry.offset !== undefined);
+            packedFiles.sort((a, b) => parseInt(a.entry.offset) - parseInt(b.entry.offset));
+
+            for (const item of packedFiles) {
+                item.oldOffset = parseInt(item.entry.offset);
+                item.oldSize = item.entry.size;
+                const patch = filePatches[item.path];
+                if (patch !== undefined && patch !== null) {
+                    const patchBuf = Buffer.isBuffer(patch) ? patch : Buffer.from(patch, 'utf8');
+                    item.patchBuffer = patchBuf;
+                    item.entry.size = patchBuf.length;
+                }
+            }
+
+            let currentOffset = BigInt(0);
+            for (const item of packedFiles) {
+                item.entry.offset = currentOffset.toString();
+                currentOffset += BigInt(item.entry.size);
+            }
+
+            const newHeaderBuf = this.createHeaderBuffer(JSON.stringify(header));
+            destFd = fs.openSync(targetAsar, 'w');
+            fs.writeSync(destFd, newHeaderBuf, 0, newHeaderBuf.length, 0);
+
+            let writePos = newHeaderBuf.length;
+            const copyBufSize = 256 * 1024;
+            const copyBuf = Buffer.alloc(copyBufSize);
+
+            for (const item of packedFiles) {
+                if (item.patchBuffer) {
+                    fs.writeSync(destFd, item.patchBuffer, 0, item.patchBuffer.length, writePos);
+                    writePos += item.patchBuffer.length;
+                } else {
+                    let remaining = item.oldSize;
+                    let readPos = baseOffset + item.oldOffset;
+                    while (remaining > 0) {
+                        const toRead = Math.min(remaining, copyBufSize);
+                        fs.readSync(srcFd, copyBuf, 0, toRead, readPos);
+                        fs.writeSync(destFd, copyBuf, 0, toRead, writePos);
+                        readPos += toRead;
+                        writePos += toRead;
+                        remaining -= toRead;
+                    }
+                }
+            }
+        } finally {
+            if (srcFd) fs.closeSync(srcFd);
+            if (destFd) fs.closeSync(destFd);
+        }
+    }
+}
+
+function installLocalization(resourcesDir) {
+    const asarPath = path.join(resourcesDir, "app.asar");
+    const bakPath = path.join(resourcesDir, "app.asar.bak");
+
+    if (!fs.existsSync(asarPath) && !fs.existsSync(bakPath)) {
+        console.error(`[ERROR] app.asar was not found in the resources directory: ${resourcesDir}`);
+        return false;
+    }
+
+    if (!fs.existsSync(bakPath)) {
+        console.log(`[BACKUP] Creating an official package backup: app.asar.bak ...`);
+        try {
+            fs.copyFileSync(asarPath, bakPath);
+            console.log(`[BACKUP] Backup completed.`);
+        } catch (e) {
+            if (e.code === 'EACCES' || e.code === 'EPERM' || e.code === 'EROFS') {
+                reportWritePermissionError(resourcesDir, e, 'back up');
+            } else {
+                console.error(`[ERROR] Could not create app.asar.bak: ${e.message}`);
+            }
+            return false;
+        }
+    }
+
+    const sourceAsar = fs.existsSync(bakPath) ? bakPath : asarPath;
+    console.log(`[READ] Parsing application package metadata...`);
+
+    const filePatches = {};
+
+    // 1. dist/preload.js
+    const preloadBuf = AsarArchive.readFile(sourceAsar, "dist/preload.js");
+    if (!preloadBuf) {
+        console.error(`[ERROR] dist/preload.js was not found in the application package.`);
+        return false;
+    }
+
+    console.log(`[PATCH] Injecting Korean localization into preload.js...`);
+    const content = preloadBuf.toString('utf-8');
+    const cleanedContent = cleanJsContent(content);
+    const translationJs = generateJs();
+
+    try {
+        new vm.Script(translationJs);
+    } catch (syntaxErr) {
+        console.error(`[FATAL] Generated localization code has a syntax error. Installation stopped to prevent a client crash: ${syntaxErr.message}`);
+        console.error(syntaxErr.stack);
+        return false;
+    }
+
+    filePatches["dist/preload.js"] = cleanedContent + "\n" + translationJs;
+    console.log(`[PATCH] preload.js completed.`);
+
+    // 2. dist/ipcHandlers.js — renderer-requested native context menus.
+    // These are Electron Menu instances, so renderer DOM translation cannot
+    // reach them. Translate their exact product labels before building the
+    // native menu template, including nested submenu entries.
+    const ipcHandlersBuf = AsarArchive.readFile(sourceAsar, "dist/ipcHandlers.js");
+    if (ipcHandlersBuf) {
+        console.log(`[PATCH] Injecting Korean native context-menu labels into ipcHandlers.js...`);
+        let ipcHandlersContent = ipcHandlersBuf.toString('utf-8');
+        const contextMenuFunction = "function buildContextMenuTemplate(items, onSelect) {";
+        const nativeContextMenuTranslationJs = `const nativeContextMenuTranslations = {
+    'Rename': '이름 바꾸기',
+    'Mark Unread': '읽지 않음으로 표시',
+    'Mark Read': '읽음으로 표시',
+    'Copy': '복사',
+    'Fork': '분기',
+    'Split': '분할',
+    'Share': '공유',
+    'View Debug': '디버그 보기',
+    'Archive': '보관',
+    'Unarchive': '보관 해제',
+    'Delete': '삭제',
+    'Conversation Name': '대화 이름',
+    'Conversation ID': '대화 ID',
+    'Workspace Name': '작업 공간 이름',
+    'Worktree Name': '작업 트리 이름',
+    'Project Name': '프로젝트 이름',
+    'Split Right': '오른쪽으로 분할',
+    'Split Down': '아래로 분할',
+    'Replace With New': '새 대화로 교체',
+    'Remove From Split': '분할에서 제거'
+};
+function translateNativeContextMenuLabel(label) {
+    return nativeContextMenuTranslations[label] ?? label;
+}
+`;
+        const labelExpression = "label: item.label ?? '',";
+        const labelOccurrences = ipcHandlersContent.split(labelExpression).length - 1;
+        if (ipcHandlersContent.includes(contextMenuFunction) && labelOccurrences === 2) {
+            ipcHandlersContent = ipcHandlersContent
+                .replace(contextMenuFunction, nativeContextMenuTranslationJs + contextMenuFunction)
+                .replaceAll(labelExpression, "label: translateNativeContextMenuLabel(item.label ?? ''),");
+            filePatches["dist/ipcHandlers.js"] = ipcHandlersContent;
+            console.log(`[PATCH] Native context-menu labels completed.`);
+        } else {
+            console.warn(`[WARNING] The expected native context-menu structure was not found in ipcHandlers.js.`);
+        }
+    }
+
+    // 3. dist/menu.js
+    const menuBuf = AsarArchive.readFile(sourceAsar, "dist/menu.js");
+    if (menuBuf) {
+        console.log(`[PATCH] Injecting Korean application-menu labels into menu.js...`);
+        let menuContent = menuBuf.toString('utf-8');
+        const menuCleaned = cleanMenuJsContent(menuContent);
+        const menuTranslationJs = `
+    ${MENU_SIGNATURE_START}
+    const translations = {
+        'File': '파일',
+        'Edit': '편집',
+        'View': '보기',
+        'Window': '창',
+        'Help': '도움말',
+        'New Window': '새 창',
+        'New Conversation': '새 대화',
+        'New Chat': '새 대화',
+        'Create Project': '프로젝트 만들기',
+        'Command Palette': '명령 팔레트',
+        'Settings': '설정',
+        'Docs': '문서',
+        'Check for Updates': '업데이트 확인',
+        'Toggle Developer Tools': '개발자 도구 전환',
+        'Undo': '실행 취소',
+        'Redo': '다시 실행',
+        'Cut': '잘라내기',
+        'Copy': '복사',
+        'Paste': '붙여넣기',
+        'Select All': '모두 선택',
+        'Minimize': '최소화',
+        'Maximize': '최대화',
+        'Close': '닫기',
+        'Zoom': '확대/축소',
+        'Reset Zoom': '확대/축소 초기화',
+        'Zoom In': '확대',
+        'Zoom Out': '축소',
+        'Toggle Full Screen': '전체 화면 전환',
+        'Version': '버전',
+        'About Antigravity': 'Antigravity 정보',
+        'Services': '서비스',
+        'Hide Antigravity': 'Antigravity 숨기기',
+        'Hide Others': '다른 항목 숨기기',
+        'Show All': '모두 표시',
+        'Quit Antigravity': 'Antigravity 종료',
+        'Quit': '종료',
+        'Connect to WSL': 'WSL에 연결',
+        'Reopen Locally': '로컬에서 다시 열기',
+        '文件': '파일',
+        '视图': '보기',
+        '窗口': '창',
+        '帮助': '도움말',
+        '新建会话': '새 대화',
+        '创建项目': '프로젝트 만들기',
+        '命令面板': '명령 팔레트',
+        '设置': '설정'
+    };
+    function translateMenu(items) {
+        for (const item of items) {
+            let label = item.label || '';
+            let mnemonic = '';
+            let cleanLabel = label;
+            const m = label.match(/&([a-zA-Z])/);
+            if (m) {
+                mnemonic = "(&" + m[1] + ")";
+                cleanLabel = label.replace('&', '');
+            }
+            if (translations[cleanLabel]) {
+                item.label = translations[cleanLabel] + mnemonic;
+            } else if (translations[label]) {
+                item.label = translations[label];
+            } else if (/^Version\\s*([\\d\\.]*)$/i.test(cleanLabel)) {
+                item.label = cleanLabel.replace(/^Version\\s*([\\d\\.]*)$/i, (match, v) => v ? "버전 " + v : "버전");
+            }
+            if (item.submenu && item.submenu.items) {
+                translateMenu(item.submenu.items);
+            }
+        }
+    }
+    translateMenu(menu.items);
+    ${MENU_SIGNATURE_END}
+    `;
+
+        const targetStr = "electron_1.Menu.setApplicationMenu(menu);";
+        const idx = menuCleaned.indexOf(targetStr);
+        if (idx !== -1) {
+            let patchedMenuContent = menuCleaned.substring(0, idx) + menuTranslationJs + "\n    " + menuCleaned.substring(idx);
+            patchedMenuContent = patchedMenuContent
+                .replace("return { label: 'Connect to WSL', submenu };", "return { label: 'WSL에 연결', submenu };")
+                .replace("return { label: 'Reopen Locally', click: () => relaunchWithWslDistro('') };", "return { label: '로컬에서 다시 열기', click: () => relaunchWithWslDistro('') };");
+            filePatches["dist/menu.js"] = patchedMenuContent;
+            console.log(`[PATCH] Application-menu labels completed.`);
+        } else {
+            console.warn(`[WARNING] The expected insertion point was not found in menu.js.`);
+        }
+    }
+
+    // 4. dist/tray.js
+    const trayBuf = AsarArchive.readFile(sourceAsar, "dist/tray.js");
+    if (trayBuf) {
+        console.log(`[PATCH] Injecting Korean tray-menu labels into tray.js...`);
+        let trayContent = trayBuf.toString('utf-8');
+        let trayCleaned = cleanTrayJsContent(trayContent);
+
+        let trayPatched = trayCleaned;
+        const createTrayMatch = trayCleaned.match(/function\s+createTray\s*\(\s*actions(?:\s*,\s*onClick)?\s*\)\s*\{/);
+        if (createTrayMatch) {
+            const matchedFuncHeader = createTrayMatch[0];
+            const replacementCreate = `${matchedFuncHeader}
+    ${TRAY_SIGNATURE_START}
+    const translations = {
+        'No agents running': '실행 중인 에이전트 없음',
+        'Open Antigravity': 'Antigravity 열기',
+        'Quit': '종료',
+        'Connect to WSL': 'WSL에 연결',
+        'Reopen Locally': '로컬에서 다시 열기'
+    };
+    for (const item of actions) {
+        if (translations[item.label]) {
+            item.label = translations[item.label];
+        }
+    }
+    ${TRAY_SIGNATURE_END}`;
+            trayPatched = trayCleaned.replace(matchedFuncHeader, replacementCreate);
+        } else {
+            console.warn(`[WARNING] The createTray insertion point was not found in tray.js.`);
+        }
+
+        const targetInsert = "function insertTrayMenuItem(position, options) {";
+        const replacementInsert = `function insertTrayMenuItem(position, options) {
+    ${TRAY_SIGNATURE_START}
+    const asyncTranslations = {
+        'Connect to WSL': 'WSL에 연결',
+        'Reopen Locally': '로컬에서 다시 열기'
+    };
+    if (options && asyncTranslations[options.label]) {
+        options.label = asyncTranslations[options.label];
+    }
+    ${TRAY_SIGNATURE_END}`;
+
+        trayPatched = trayPatched.replace(targetInsert, replacementInsert);
+
+        const countRegex = /countItem\.label\s*=\s*\([\s\S]*?' running';/g;
+        const replacementCount = "countItem.label = count > 0 ? `${count}개 에이전트 실행 중` : '실행 중인 에이전트 없음';";
+        trayPatched = trayPatched.replace(countRegex, replacementCount);
+
+        filePatches["dist/tray.js"] = trayPatched;
+        console.log(`[PATCH] Tray-menu labels completed.`);
+    }
+
+    // 5. dist/updater.js
+    const updaterBuf = AsarArchive.readFile(sourceAsar, "dist/updater.js");
+    if (updaterBuf) {
+        console.log(`[PATCH] Injecting Korean update-dialog labels into updater.js...`);
+        let updaterContent = updaterBuf.toString('utf-8');
+        const targetOptions = `                title: 'Check for Updates',
+                message: 'No updates available',
+                buttons: ['OK'],`;
+        const replacementOptions = `                title: '업데이트 확인',
+                message: '사용 가능한 업데이트가 없습니다',
+                buttons: ['확인'],`;
+
+        updaterContent = updaterContent.replace(targetOptions, replacementOptions);
+        filePatches["dist/updater.js"] = updaterContent;
+        console.log(`[PATCH] Update-dialog labels completed.`);
+    }
+
+    // 6. dist/provisionSplash.js
+    const splashBuf = AsarArchive.readFile(sourceAsar, "dist/provisionSplash.js");
+    if (splashBuf) {
+        console.log(`[PATCH] Injecting Korean WSL setup text into provisionSplash.js...`);
+        let splashContent = splashBuf.toString('utf-8');
+        splashContent = splashContent.replace('<div>Setting up WSL: ${escapeHtml(distro)}</div>', '<div>WSL 설정 중: ${escapeHtml(distro)}</div>');
+        filePatches["dist/provisionSplash.js"] = splashContent;
+        console.log(`[PATCH] WSL setup text completed.`);
+    }
+
+    // 7. dist/wsl.js
+    const wslBuf = AsarArchive.readFile(sourceAsar, "dist/wsl.js");
+    if (wslBuf) {
+        console.log(`[PATCH] Injecting Korean WSL server-installation text into wsl.js...`);
+        let wslContent = wslBuf.toString('utf-8');
+        wslContent = wslContent
+            .replace("onStatus?.('Downloading the Antigravity binary\\u2026');", "onStatus?.('Antigravity 바이너리 다운로드 중\\u2026');")
+            .replace("onStatus?.(`Installing into ${distro}\\u2026`);", "onStatus?.(`${distro}에 설치 중\\u2026`);");
+        filePatches["dist/wsl.js"] = wslContent;
+        console.log(`[PATCH] WSL server-installation text completed.`);
+    }
+
+    // 8. dist/main.js
+    const mainBuf = AsarArchive.readFile(sourceAsar, "dist/main.js");
+    if (mainBuf) {
+        console.log(`[PATCH] Injecting Korean WSL messages into main.js...`);
+        let mainContent = mainBuf.toString('utf-8');
+        mainContent = mainContent
+            .replace("await electron_1.dialog.showErrorBox('WSL setup failed', msg);", "await electron_1.dialog.showErrorBox('WSL 설정 실패', msg);")
+            .replace("`Failed to install the server into WSL distro \"${WSL_DISTRO}\":\\n${err.message}`", "`WSL 배포판 \"${WSL_DISTRO}\"에 서버를 설치하지 못했습니다:\\n${err.message}`");
+        filePatches["dist/main.js"] = mainContent;
+        console.log(`[PATCH] Main-process WSL messages completed.`);
+    }
+
+    // 9. 打包并写入 app.asar
+    const tempAsarPath = path.join(resourcesDir, "app.asar.tmp");
+    try {
+        console.log(`[PACKAGE] Writing the patched content to app.asar...`);
+        AsarArchive.patchArchive(sourceAsar, tempAsarPath, filePatches);
+
+        try {
+            if (fs.existsSync(asarPath)) {
+                fs.unlinkSync(asarPath);
+            }
+            fs.renameSync(tempAsarPath, asarPath);
+        } catch (renameErr) {
+            try {
+                fs.copyFileSync(tempAsarPath, asarPath);
+                fs.unlinkSync(tempAsarPath);
+            } catch (copyErr) {
+                if (copyErr.code === 'EBUSY' || copyErr.code === 'EPERM' || renameErr.code === 'EBUSY' || renameErr.code === 'EPERM') {
+                    console.error(`[ERROR] app.asar is locked. Close Antigravity completely and try again.`);
+                } else {
+                    console.error(`[ERROR] Could not replace app.asar: ${copyErr.message}`);
+                }
+                return false;
+            }
+        }
+    } catch (err) {
+        try { if (fs.existsSync(tempAsarPath)) fs.unlinkSync(tempAsarPath); } catch (e) {}
+        console.error(`[ERROR] Could not package the localization patch: ${err.message}`);
+        return false;
+    }
+
+    // 清理可能遗留的历史临时解压目录
+    const legacyTempDir = path.join(__dirname, "_temp_asar");
+    if (fs.existsSync(legacyTempDir)) {
+        try { fs.rmSync(legacyTempDir, { recursive: true, force: true }); } catch (e) {}
+    }
+
+    console.log(`[OK] Antigravity Korean localization is installed.`);
+    if (process.platform === 'darwin') {
+        if (!resignAppOnMac(resourcesDir)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function restoreLocalization(resourcesDir) {
+    const asarPath = path.join(resourcesDir, "app.asar");
+    const bakPath = path.join(resourcesDir, "app.asar.bak");
+
+    if (!fs.existsSync(bakPath)) {
+        console.log("[WARNING] app.asar.bak was not found. Localization may not have been installed, or the backup was removed.");
+        return false;
+    }
+
+    console.log("[RESTORE] Restoring the official backup...");
+    try {
+        fs.copyFileSync(bakPath, asarPath);
+        fs.unlinkSync(bakPath);
+    } catch (e) {
+        if (e.code === 'EACCES' || e.code === 'EPERM' || e.code === 'EROFS') {
+            reportWritePermissionError(resourcesDir, e, 'restore', 'uninstall.sh');
+        } else {
+            console.error(`[ERROR] Could not restore app.asar: ${e.message}`);
+        }
+        return false;
+    }
+    console.log("[OK] The official app.asar was restored.");
+    if (process.platform === 'darwin') {
+        if (!resignAppOnMac(resourcesDir)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function main() {
+    if (process.platform !== 'win32') {
+        const shellScripts = [
+            'install.sh',
+            'uninstall.sh',
+            'install-korean-macos.command',
+            'restore-original-macos.command'
+        ];
+        for (const script of shellScripts) {
+            const scriptPath = path.join(__dirname, script);
+            if (fs.existsSync(scriptPath)) {
+                try {
+                    fs.chmodSync(scriptPath, 0o755);
+                } catch (e) {}
+            }
+        }
+    }
+
+    let huifu = false;
+    let manualDir = "";
+    let noKill = false;
+    let checkWriteOnly = false;
+
+    const args = process.argv.slice(2);
+    for (let i = 0; i < args.length; i++) {
+        if (args[i] === '--huifu') {
+            huifu = true;
+        } else if (args[i] === '--install-dir') {
+            manualDir = args[i + 1] || "";
+            i++;
+        } else if (args[i] === '--no-kill') {
+            noKill = true;
+        } else if (args[i] === '--brand-title') {
+            i++;
+        } else if (args[i] === '--check-write') {
+            checkWriteOnly = true;
+        }
+    }
+
+    if (checkWriteOnly) {
+        const installDir = detectInstallationDir(manualDir, { quiet: true });
+        if (!installDir) {
+            process.exit(3);
+        }
+        let resourcesDir = "";
+        if (fs.existsSync(path.join(installDir, "resources"))) {
+            resourcesDir = path.join(installDir, "resources");
+        } else if (fs.existsSync(path.join(installDir, "Contents", "Resources"))) {
+            resourcesDir = path.join(installDir, "Contents", "Resources");
+        } else if (installDir.replace(/\/$/, "").toLowerCase().endsWith("/resources")) {
+            resourcesDir = installDir;
+        } else if (fs.existsSync(path.join(installDir, "app.asar"))) {
+            resourcesDir = installDir;
+        } else {
+            resourcesDir = path.join(installDir, "resources");
+        }
+
+        if (!fs.existsSync(resourcesDir)) {
+            process.exit(3);
+        }
+
+        const asarPath = path.join(resourcesDir, "app.asar");
+        const bakPath = path.join(resourcesDir, "app.asar.bak");
+        if (!fs.existsSync(asarPath) && !fs.existsSync(bakPath)) {
+            process.exit(3);
+        }
+
+        try {
+            fs.accessSync(resourcesDir, fs.constants.W_OK | fs.constants.X_OK);
+            if (fs.existsSync(asarPath)) {
+                fs.accessSync(asarPath, fs.constants.R_OK | fs.constants.W_OK);
+            }
+            if (fs.existsSync(bakPath)) {
+                fs.accessSync(bakPath, fs.constants.R_OK | fs.constants.W_OK);
+            }
+            if (process.platform === 'darwin') {
+                const targetApp = findMacAppBundle(resourcesDir);
+                if (targetApp) {
+                    fs.accessSync(targetApp, fs.constants.W_OK | fs.constants.X_OK);
+                }
+            }
+            process.exit(0);
+        } catch (e) {
+            process.exit(2);
+        }
+    }
+
+    const installDir = detectInstallationDir(manualDir);
+
+    let resourcesDir = "";
+    if (fs.existsSync(path.join(installDir, "resources"))) {
+        resourcesDir = path.join(installDir, "resources");
+    } else if (fs.existsSync(path.join(installDir, "Contents", "Resources"))) {
+        resourcesDir = path.join(installDir, "Contents", "Resources");
+    } else if (installDir.replace(/\/$/, "").toLowerCase().endsWith("/resources")) {
+        resourcesDir = installDir;
+    } else if (fs.existsSync(path.join(installDir, "app.asar"))) {
+        resourcesDir = installDir;
+    } else {
+        resourcesDir = path.join(installDir, "resources");
+    }
+
+    if (!fs.existsSync(resourcesDir)) {
+        console.error(`[ERROR] Could not locate a valid resources directory: ${resourcesDir}`);
+        process.exit(1);
+    }
+
+    if (!canWriteAntigravityResources(resourcesDir, huifu ? 'uninstall.sh' : 'install.sh')) {
+        process.exit(1);
+    }
+
+    wasAppRunning = checkIfAppIsRunning();
+    if (noKill) {
+        console.log("[SKIP] --no-kill is set. Antigravity processes will not be closed.");
+    } else if (wasAppRunning) {
+        if (!closeAntigravityProcesses()) {
+            process.exit(1);
+        }
+    } else {
+        console.log("[SKIP] Antigravity is not running.");
+    }
+
+    let success = false;
+    if (huifu) {
+        console.log("====== Restoring the official Antigravity package ======");
+        success = restoreLocalization(resourcesDir);
+    } else {
+        console.log("====== Installing Antigravity Korean localization ======");
+        success = installLocalization(resourcesDir);
+    }
+
+    if (!success) {
+        process.exit(1);
+    }
+
+    if (success && wasAppRunning && !noKill) {
+        console.log("\n[START] Antigravity was running before installation. Restarting it...");
+        try {
+            let launched = false;
+            let restartDeferred = false;
+            if (process.platform === 'win32') {
+                const exePath = path.join(installDir, 'Antigravity.exe');
+                if (fs.existsSync(exePath)) {
+                    const child = child_process.spawn(exePath, [], { detached: true, stdio: 'ignore' });
+                    child.unref();
+                    console.log("[START] Antigravity started successfully.");
+                    launched = true;
+                }
+            } else {
+                const runningUnderSudo = typeof process.getuid === 'function'
+                    && process.getuid() === 0
+                    && process.env.SUDO_USER
+                    && process.env.SUDO_USER !== 'root';
+                if (runningUnderSudo) {
+                    console.log("[INFO] Installation used sudo. Start Antigravity manually to avoid running the desktop app as root.");
+                    restartDeferred = true;
+                } else if (process.platform === 'darwin') {
+                    const targetApp = findMacAppBundle(resourcesDir) || (installDir.endsWith('.app') ? installDir : null);
+                    if (targetApp && fs.existsSync(targetApp)) {
+                        child_process.spawn('open', [targetApp], { detached: true, stdio: 'ignore' }).unref();
+                        console.log("[START] Antigravity started successfully.");
+                        launched = true;
+                    } else {
+                        try {
+                            child_process.spawn('open', ['-a', 'Antigravity'], { detached: true, stdio: 'ignore' }).unref();
+                            console.log("[START] Antigravity started successfully.");
+                            launched = true;
+                        } catch (e) {}
+                    }
+                } else {
+                    const exeCandidates = [
+                        path.join(installDir, 'antigravity'),
+                        path.join(installDir, 'Antigravity'),
+                        path.join(installDir, 'bin', 'antigravity'),
+                    ];
+                    for (const exePath of exeCandidates) {
+                        if (fs.existsSync(exePath)) {
+                            const child = child_process.spawn(exePath, [], { detached: true, stdio: 'ignore' });
+                            child.unref();
+                            console.log("[START] Antigravity started successfully.");
+                            launched = true;
+                            break;
+                        }
+                    }
+                    if (!launched) {
+                        try {
+                            const whichOut = child_process.execSync('command -v antigravity 2>/dev/null || which antigravity 2>/dev/null || command -v Antigravity 2>/dev/null || which Antigravity 2>/dev/null || command -v agy 2>/dev/null || which agy 2>/dev/null', { encoding: 'utf-8' }).trim();
+                            if (whichOut) {
+                                const child = child_process.spawn(whichOut, [], { detached: true, stdio: 'ignore' });
+                                child.unref();
+                                console.log("[START] Antigravity started successfully.");
+                                launched = true;
+                            }
+                        } catch (e) {}
+                    }
+                }
+            }
+            if (!launched && !restartDeferred) {
+                console.warn("[WARNING] The Antigravity executable was not found. Start it manually.");
+            }
+        } catch (e) {
+            console.warn(`[WARNING] Could not start Antigravity: ${e.message}`);
+        }
+    }
+}
+
+main();

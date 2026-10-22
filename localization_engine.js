@@ -1671,7 +1671,16 @@ function generateJs() {
 
     function getDynamicProductUiTranslation(value) {
         const normalized = norm(value);
-        let match = normalized.match(/^When toggled on,\\s+(.+?)\\s+collects usage data to help Google enhance performance and features\\.$/i);
+        let match = normalized.match(/^Managed by the\\s+(.+?)\\s+plugin$/i);
+        if (match) return match[1] + " 플러그인에서 관리";
+
+        match = normalized.match(/^Managed by the\\s+(.+?)\\s+automation$/i);
+        if (match) return match[1] + " 자동화에서 관리";
+
+        match = normalized.match(/^Available for\\s+(.+?)\\s+project$/i);
+        if (match) return match[1] + " 프로젝트에서 사용 가능";
+
+        match = normalized.match(/^When toggled on,\\s+(.+?)\\s+collects usage data to help Google enhance performance and features\\.$/i);
         if (match) return "启用后，" + match[1] + " 会收集使用数据，以帮助 Google 改进性能和功能";
 
         match = normalized.match(/^Receive product updates, tips, and promotions from Google\\s+(.+?)\\s+via email\\.$/i);
@@ -4337,9 +4346,9 @@ function resignAppOnMac(resourcesDir) {
         console.warn(`[WARNING] xattr reported a message while clearing quarantine attributes: ${xattrRes.stderr || xattrRes.stdout}`);
     }
 
-    // 由内而外（Inside-Out）优先重签内部 Frameworks / Dylibs / Helpers，
-    // 嵌套的 .framework 与 .app 需带上 --deep 确保其内部动态库及辅助程序完成签名，
-    // 避免顶层签名时遗留旧签名导致 dyld 报签名/校验不一致。
+    // 내부에서 바깥쪽 순서로 Frameworks, Dylibs와 Helpers에 먼저 다시 서명한다.
+    // 중첩된 .framework와 .app에는 --deep을 사용해 내부 라이브러리와 보조 프로그램까지 서명한다.
+    // 이렇게 해야 최상위 서명에서 이전 서명이 남아 dyld 검증 불일치가 생기는 일을 막을 수 있다.
     const frameworksDir = path.join(targetApp, 'Contents', 'Frameworks');
     if (fs.existsSync(frameworksDir)) {
         try {
@@ -4363,9 +4372,9 @@ function resignAppOnMac(resourcesDir) {
         }
     }
 
-    // 注意：绝不能传入 --preserve-metadata=flags,runtime！
-    // 否则会保留 Hardened Runtime（硬化运行时），而硬化运行时默认强制执行 Library Validation（库校验）；
-    // 在本地自签名（ad-hoc，-）缺少 Apple Team ID 的情况下，dyld 会因 Team ID 不一致在启动阶段直接终止进程闪退（SIGABRT）。
+    // --preserve-metadata=flags,runtime은 사용하지 않는다.
+    // Hardened Runtime이 유지되면 Library Validation이 기본으로 강제된다.
+    // Apple Team ID가 없는 ad-hoc 서명에서는 Team ID 불일치로 dyld가 시작 단계에서 종료될 수 있다(SIGABRT).
     const signRes = runCommandSync('codesign', [
         '--force',
         '--deep',
@@ -4583,7 +4592,8 @@ function installLocalization(resourcesDir) {
         console.log(`[PATCH] Injecting Korean native context-menu labels into ipcHandlers.js...`);
         let ipcHandlersContent = ipcHandlersBuf.toString('utf-8');
         const contextMenuFunction = "function buildContextMenuTemplate(items, onSelect) {";
-        const nativeContextMenuTranslationJs = `const nativeContextMenuTranslations = {
+        const nativeContextMenuTranslationJs = `${MENU_SIGNATURE_START}
+const nativeContextMenuTranslations = {
     'Rename': '이름 바꾸기',
     'Mark Unread': '읽지 않음으로 표시',
     'Mark Read': '읽음으로 표시',
@@ -4608,6 +4618,7 @@ function installLocalization(resourcesDir) {
 function translateNativeContextMenuLabel(label) {
     return nativeContextMenuTranslations[label] ?? label;
 }
+${MENU_SIGNATURE_END}
 `;
         const labelExpression = "label: item.label ?? '',";
         const labelOccurrences = ipcHandlersContent.split(labelExpression).length - 1;
@@ -4822,7 +4833,7 @@ function translateNativeContextMenuLabel(label) {
         console.log(`[PATCH] Main-process WSL messages completed.`);
     }
 
-    // 9. 打包并写入 app.asar
+    // 9. 패치 내용을 app.asar로 패키징
     const tempAsarPath = path.join(resourcesDir, "app.asar.tmp");
     try {
         console.log(`[PACKAGE] Writing the patched content to app.asar...`);
@@ -4852,7 +4863,7 @@ function translateNativeContextMenuLabel(label) {
         return false;
     }
 
-    // 清理可能遗留的历史临时解压目录
+    // 이전 버전에서 남았을 수 있는 임시 압축 해제 폴더 정리
     const legacyTempDir = path.join(__dirname, "_temp_asar");
     if (fs.existsSync(legacyTempDir)) {
         try { fs.rmSync(legacyTempDir, { recursive: true, force: true }); } catch (e) {}
